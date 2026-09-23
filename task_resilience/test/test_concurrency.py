@@ -19,7 +19,14 @@ import threading
 
 import pytest
 
-from task_resilience.errors import AttemptLimitReached, IdempotencyConflict
+from task_resilience.errors import (
+    AttemptLimitReached,
+    IdempotencyConflict,
+    InvalidStateTransition,
+    MissionCompletionInvariantError,
+    StepDefinitionConflict,
+)
+from task_resilience.state_machine import MissionState, StepState
 from task_resilience.storage import MissionStore
 
 # Each round is an independent race. A single race can be won "by luck" if the
@@ -155,7 +162,7 @@ def test_concurrent_first_open_creates_the_schema_once(tmp_path):
                 future.result(timeout=TIMEOUT)
 
         with contextlib.closing(sqlite3.connect(path)) as conn:
-            assert conn.execute('PRAGMA user_version').fetchone()[0] == 1
+            assert conn.execute('PRAGMA user_version').fetchone()[0] == 2
 
 
 def test_lock_timeout_surfaces_and_consumes_nothing(db_path):
@@ -174,3 +181,155 @@ def test_lock_timeout_surfaces_and_consumes_nothing(db_path):
         # The failed attempt must not have counted, and the store must still work.
         assert store.get_by_mission_id(mission.mission_id).attempts_used == 0
         assert store.consume_attempt(mission.mission_id).attempts_used == 1
+
+
+def missions_with_an_executing_step(db_path, count, running=False):
+    mission_ids = []
+    with MissionStore(db_path) as store:
+        for n in range(count):
+            mission = store.create_or_get(f'req-{n}', {'n': n}, 3)
+            store.initialize_steps(mission.mission_id, ['checkpoint'])
+            for state in (StepState.DISPATCH_PREPARED, StepState.DISPATCHED,
+                          StepState.ACCEPTED, StepState.EXECUTING):
+                store.transition_step_state(mission.mission_id, 'checkpoint', state)
+            if running:
+                store.transition_mission_state(mission.mission_id, MissionState.RUNNING)
+            mission_ids.append(mission.mission_id)
+    return mission_ids
+
+
+def test_competing_step_results_have_exactly_one_winner(db_path):
+    mission_ids = missions_with_an_executing_step(db_path, ROUNDS)
+    results_to_report = [StepState.SUCCEEDED, StepState.FAILED]
+
+    def report(store, worker, n):
+        try:
+            store.transition_step_state(mission_ids[n], 'checkpoint', results_to_report[worker])
+        except InvalidStateTransition as refusal:
+            return refusal
+        return results_to_report[worker]
+
+    results = run_concurrently(db_path, 2, ROUNDS, report)
+
+    with MissionStore(db_path) as store:
+        for n, mission_id in enumerate(mission_ids):
+            outcomes = [worker[n] for worker in results]
+            won = [outcome for outcome in outcomes if isinstance(outcome, StepState)]
+            lost = [outcome for outcome in outcomes if isinstance(outcome, InvalidStateTransition)]
+            assert len(won) == 1 and len(lost) == 1, f'round {n}: {outcomes}'
+
+            assert store.get_step(mission_id, 'checkpoint').state is won[0]
+            # The loser saw the winner's persisted state and was refused by the
+            # state machine, not by the database.
+            (other,) = set(results_to_report) - {won[0]}
+            assert lost[0].entity == 'step'
+            assert lost[0].current is won[0]
+            assert lost[0].target is other
+
+
+def test_concurrent_identical_step_results_all_succeed(db_path):
+    workers = 4
+    mission_ids = missions_with_an_executing_step(db_path, ROUNDS)
+
+    results = run_concurrently(
+        db_path, workers, ROUNDS,
+        lambda store, worker, n: store.transition_step_state(
+            mission_ids[n], 'checkpoint', StepState.SUCCEEDED))
+
+    for n, mission_id in enumerate(mission_ids):
+        records = [worker[n] for worker in results]
+        assert {record.state for record in records} == {StepState.SUCCEEDED}
+        # Only the first call changed anything; the rest replayed the same state.
+        assert len({record.updated_at for record in records}) == 1, f'round {n}'
+    with MissionStore(db_path) as store:
+        assert {store.get_step(mission_id, 'checkpoint').state
+                for mission_id in mission_ids} == {StepState.SUCCEEDED}
+
+
+def test_completion_never_overtakes_an_unfinished_step(db_path):
+    mission_ids = missions_with_an_executing_step(db_path, ROUNDS, running=True)
+
+    def act(store, worker, n):
+        if worker == 0:
+            try:
+                store.transition_mission_state(mission_ids[n], MissionState.COMPLETED)
+            except MissionCompletionInvariantError as refusal:
+                return refusal
+            return MissionState.COMPLETED
+        return store.transition_step_state(mission_ids[n], 'checkpoint', StepState.SUCCEEDED).state
+
+    results = run_concurrently(db_path, 2, ROUNDS, act)
+
+    with MissionStore(db_path) as store:
+        for n, mission_id in enumerate(mission_ids):
+            mission_outcome, step_outcome = results[0][n], results[1][n]
+            mission = store.get_by_mission_id(mission_id)
+
+            # The step result always lands; only the completion depends on the order.
+            assert step_outcome is StepState.SUCCEEDED
+            assert store.get_step(mission_id, 'checkpoint').state is StepState.SUCCEEDED
+            if mission_outcome is MissionState.COMPLETED:
+                assert mission.state is MissionState.COMPLETED
+            else:
+                assert isinstance(mission_outcome, MissionCompletionInvariantError)
+                assert mission_outcome.step_states == (StepState.EXECUTING,)
+                assert mission.state is MissionState.RUNNING
+
+    # The invariant, read straight from storage: no COMPLETED mission has zero
+    # steps or any step that is not SUCCEEDED.
+    with contextlib.closing(sqlite3.connect(db_path)) as conn:
+        violations = conn.execute(
+            """
+            SELECT m.mission_id FROM missions m
+            WHERE m.mission_state = 'COMPLETED' AND (
+                NOT EXISTS (SELECT 1 FROM mission_steps s WHERE s.mission_id = m.mission_id)
+                OR EXISTS (SELECT 1 FROM mission_steps s
+                           WHERE s.mission_id = m.mission_id AND s.step_state <> 'SUCCEEDED')
+            )
+            """).fetchall()
+    assert violations == []
+
+
+def test_conflicting_step_definitions_accept_exactly_one(db_path):
+    with MissionStore(db_path) as store:
+        mission_ids = [
+            store.create_or_get(f'req-{n}', {'n': n}, 1).mission_id for n in range(ROUNDS)]
+    definitions = [['a', 'b'], ['b', 'a', 'c']]
+
+    def define(store, worker, n):
+        try:
+            return store.initialize_steps(mission_ids[n], definitions[worker])
+        except StepDefinitionConflict as conflict:
+            return conflict
+
+    results = run_concurrently(db_path, 2, ROUNDS, define)
+
+    with MissionStore(db_path) as store:
+        for n, mission_id in enumerate(mission_ids):
+            outcomes = [worker[n] for worker in results]
+            won = [outcome for outcome in outcomes if isinstance(outcome, tuple)]
+            lost = [outcome for outcome in outcomes if isinstance(outcome, StepDefinitionConflict)]
+            assert len(won) == 1 and len(lost) == 1, f'round {n}: {outcomes}'
+
+            stored = store.get_steps(mission_id)
+            assert stored == won[0]
+            winning_keys = [step.step_key for step in stored]
+            (other_keys,) = [keys for keys in definitions if keys != winning_keys]
+            assert lost[0].existing_keys == tuple(winning_keys)
+            assert lost[0].requested_keys == tuple(other_keys)
+
+
+def test_concurrent_identical_step_definitions_create_one_list(db_path):
+    with MissionStore(db_path) as store:
+        mission_ids = [
+            store.create_or_get(f'req-{n}', {'n': n}, 1).mission_id for n in range(ROUNDS)]
+
+    results = run_concurrently(
+        db_path, 8, ROUNDS,
+        lambda store, worker, n: store.initialize_steps(mission_ids[n], ['a', 'b', 'c']))
+
+    with MissionStore(db_path) as store:
+        for n, mission_id in enumerate(mission_ids):
+            assert {worker[n] for worker in results} == {store.get_steps(mission_id)}
+    with contextlib.closing(sqlite3.connect(db_path)) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM mission_steps').fetchone()[0] == 3 * ROUNDS

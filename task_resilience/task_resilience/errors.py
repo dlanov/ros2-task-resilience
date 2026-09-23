@@ -71,3 +71,39 @@ class MissionCompletionInvariantError(Exception):
         super().__init__(f'mission cannot complete from {current.value}; step states: {seen}')
         self.current = current
         self.step_states = step_states
+
+
+class StepDefinitionConflict(Exception):
+    """A mission's steps were already defined, and the requested keys differ."""
+
+    def __init__(
+        self,
+        mission_id: str,
+        existing_keys: tuple[str, ...],
+        requested_keys: tuple[str, ...],
+    ) -> None:
+        super().__init__(
+            f'mission {mission_id!r} already has steps {list(existing_keys)}, '
+            f'not {list(requested_keys)}')
+        self.mission_id = mission_id
+        self.existing_keys = existing_keys
+        self.requested_keys = requested_keys
+
+
+class StepNotFound(Exception):
+    """The mission exists but has no step with this key."""
+
+    def __init__(self, mission_id: str, step_key: str) -> None:
+        super().__init__(f'mission {mission_id!r} has no step {step_key!r}')
+        self.mission_id = mission_id
+        self.step_key = step_key
+
+
+class CorruptStoredState(Exception):
+    """The database holds a state value that is not a known state."""
+
+    def __init__(self, entity: str, mission_id: str, value: object) -> None:
+        super().__init__(f'{entity} of mission {mission_id!r} has unknown stored state {value!r}')
+        self.entity = entity
+        self.mission_id = mission_id
+        self.value = value

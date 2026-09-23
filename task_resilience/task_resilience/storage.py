@@ -12,27 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 import contextlib
 from datetime import datetime, timezone
+import enum
 import json
 import os
 import sqlite3
-from typing import Any
+from typing import Any, TypeVar
 import uuid
 
 from .errors import (
     AttemptLimitReached,
+    CorruptStoredState,
     IdempotencyConflict,
     MissionNotFound,
+    StepDefinitionConflict,
+    StepNotFound,
     UnsupportedSchemaVersion,
 )
-from .model import MissionRecord, MissionRequest
+from .model import MissionRecord, MissionRequest, StepRecord, validate_step_keys
+from .state_machine import MissionState, StepState, transition_mission, transition_step
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
+_State = TypeVar('_State', bound=enum.Enum)
+
+# The state lists are spelled out rather than built from the enums: this is
+# what schema version 2 is. A new state needs a new schema version, and a test
+# compares these lists with the enums.
+#
 # request_json is the canonical payload only; max_attempts has its own column.
-_SCHEMA = """
+_MISSIONS_DDL = """
 CREATE TABLE missions (
     mission_id          TEXT PRIMARY KEY,
     request_id          TEXT NOT NULL UNIQUE,
@@ -42,18 +53,55 @@ CREATE TABLE missions (
     attempts_used       INTEGER NOT NULL DEFAULT 0 CHECK (attempts_used >= 0),
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL,
+    mission_state       TEXT NOT NULL CHECK (mission_state IN (
+        'ACCEPTED', 'RUNNING', 'CANCELLING', 'COMPLETED', 'FAILED', 'CANCELLED',
+        'NEEDS_RECONCILIATION'
+    )),
     CHECK (attempts_used <= max_attempts)
 )
 """
 
+_MISSION_STEPS_DDL = """
+CREATE TABLE mission_steps (
+    mission_id  TEXT NOT NULL REFERENCES missions (mission_id) ON DELETE CASCADE,
+    step_key    TEXT NOT NULL CHECK (step_key <> ''),
+    step_index  INTEGER NOT NULL CHECK (step_index >= 0),
+    step_state  TEXT NOT NULL CHECK (step_state IN (
+        'PENDING', 'DISPATCH_PREPARED', 'DISPATCHED', 'ACCEPTED', 'EXECUTING',
+        'SUCCEEDED', 'FAILED', 'CANCEL_REQUESTED', 'CANCELLED', 'OUTCOME_UNKNOWN'
+    )),
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (mission_id, step_key),
+    UNIQUE (mission_id, step_index)
+)
+"""
+
+_RENAME_V1_MISSIONS = 'ALTER TABLE missions RENAME TO missions_v1'
+
+_COPY_V1_MISSIONS = """
+INSERT INTO missions (
+    mission_id, request_id, request_fingerprint, request_json,
+    max_attempts, attempts_used, created_at, updated_at, mission_state
+)
+SELECT
+    mission_id, request_id, request_fingerprint, request_json,
+    max_attempts, attempts_used, created_at, updated_at, ?
+FROM missions_v1
+ORDER BY rowid
+"""
+
+_DROP_V1_MISSIONS = 'DROP TABLE missions_v1'
+
 _BY_MISSION_ID = 'SELECT * FROM missions WHERE mission_id = ?'
 _BY_REQUEST_ID = 'SELECT * FROM missions WHERE request_id = ?'
+_MISSION_EXISTS = 'SELECT 1 FROM missions WHERE mission_id = ?'
 
 _INSERT = """
 INSERT INTO missions (
     mission_id, request_id, request_fingerprint, request_json,
-    max_attempts, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?)
+    max_attempts, mission_state, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 # The limit is checked in the WHERE clause, so a mission that is already at
@@ -64,9 +112,39 @@ SET attempts_used = attempts_used + 1, updated_at = ?
 WHERE mission_id = ? AND attempts_used < max_attempts
 """
 
+_SET_MISSION_STATE = 'UPDATE missions SET mission_state = ?, updated_at = ? WHERE mission_id = ?'
+
+_STEPS_OF_MISSION = 'SELECT * FROM mission_steps WHERE mission_id = ? ORDER BY step_index'
+_STEP_BY_KEY = 'SELECT * FROM mission_steps WHERE mission_id = ? AND step_key = ?'
+
+_INSERT_STEP = """
+INSERT INTO mission_steps (
+    mission_id, step_key, step_index, step_state, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?)
+"""
+
+_SET_STEP_STATE = """
+UPDATE mission_steps SET step_state = ?, updated_at = ?
+WHERE mission_id = ? AND step_key = ?
+"""
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec='microseconds')
+
+
+def _require_kind(value: object, kind: type[enum.Enum], name: str) -> None:
+    if not isinstance(value, kind):
+        raise TypeError(f'{name} must be a {kind.__name__}, got {value!r}')
+
+
+def _parse_state(kind: type[_State], value: object, entity: str, mission_id: str) -> _State:
+    # The CHECK constraints should make this unreachable. If it is reached,
+    # fail loudly rather than guess which state was meant.
+    try:
+        return kind(value)
+    except ValueError:
+        raise CorruptStoredState(entity, mission_id, value) from None
 
 
 def _to_record(row: sqlite3.Row) -> MissionRecord:
@@ -77,6 +155,18 @@ def _to_record(row: sqlite3.Row) -> MissionRecord:
         payload=json.loads(row['request_json']),
         max_attempts=row['max_attempts'],
         attempts_used=row['attempts_used'],
+        state=_parse_state(MissionState, row['mission_state'], 'mission', row['mission_id']),
+        created_at=datetime.fromisoformat(row['created_at']),
+        updated_at=datetime.fromisoformat(row['updated_at']),
+    )
+
+
+def _to_step(row: sqlite3.Row) -> StepRecord:
+    return StepRecord(
+        mission_id=row['mission_id'],
+        step_key=row['step_key'],
+        step_index=row['step_index'],
+        state=_parse_state(StepState, row['step_state'], 'step', row['mission_id']),
         created_at=datetime.fromisoformat(row['created_at']),
         updated_at=datetime.fromisoformat(row['updated_at']),
     )
@@ -102,6 +192,8 @@ class MissionStore:
             # Favor SQLite's strongest normal durability setting for committed
             # attempts.
             self._conn.execute('PRAGMA synchronous = FULL')
+            # Off by default in SQLite, and set per connection.
+            self._conn.execute('PRAGMA foreign_keys = ON')
             self._init_schema()
         except BaseException:
             self._conn.close()
@@ -130,7 +222,7 @@ class MissionStore:
             self._conn.execute(
                 _INSERT,
                 (mission_id, request_id, request.fingerprint, request.payload_json,
-                 max_attempts, now, now))
+                 max_attempts, MissionState.ACCEPTED.value, now, now))
             return self._require(_BY_MISSION_ID, mission_id)
 
     def get_by_mission_id(self, mission_id: str) -> MissionRecord:
@@ -146,6 +238,64 @@ class MissionStore:
             if not updated:
                 raise AttemptLimitReached(mission_id, record.max_attempts)
             return record
+
+    def initialize_steps(
+        self, mission_id: str, step_keys: Iterable[str],
+    ) -> tuple[StepRecord, ...]:
+        keys = validate_step_keys(step_keys)
+        with self._transaction():
+            self._require_mission(mission_id)
+            existing = self._fetch_steps(mission_id)
+            if existing:
+                # A replay must match exactly, order included. The step list is
+                # never silently replaced.
+                existing_keys = tuple(step.step_key for step in existing)
+                if existing_keys != keys:
+                    raise StepDefinitionConflict(mission_id, existing_keys, keys)
+                return existing
+
+            now = _utc_now()
+            self._conn.executemany(
+                _INSERT_STEP,
+                [(mission_id, key, index, StepState.PENDING.value, now, now)
+                 for index, key in enumerate(keys)])
+            return self._fetch_steps(mission_id)
+
+    def get_steps(self, mission_id: str) -> tuple[StepRecord, ...]:
+        self._require_mission(mission_id)
+        return self._fetch_steps(mission_id)
+
+    def get_step(self, mission_id: str, step_key: str) -> StepRecord:
+        return self._require_step(mission_id, step_key)
+
+    def transition_mission_state(self, mission_id: str, target: MissionState) -> MissionRecord:
+        _require_kind(target, MissionState, 'target')
+        with self._transaction():
+            mission = self._require(_BY_MISSION_ID, mission_id)
+            steps = self._fetch_steps(mission_id)
+            # The state machine decides, including the completion invariant
+            # over the persisted steps. Nothing is written unless it agrees.
+            new_state = transition_mission(
+                mission.state, target, [step.state for step in steps])
+            if new_state is mission.state:
+                return mission
+
+            self._conn.execute(_SET_MISSION_STATE, (new_state.value, _utc_now(), mission_id))
+            return self._require(_BY_MISSION_ID, mission_id)
+
+    def transition_step_state(
+        self, mission_id: str, step_key: str, target: StepState,
+    ) -> StepRecord:
+        _require_kind(target, StepState, 'target')
+        with self._transaction():
+            step = self._require_step(mission_id, step_key)
+            new_state = transition_step(step.state, target)
+            if new_state is step.state:
+                return step
+
+            self._conn.execute(
+                _SET_STEP_STATE, (new_state.value, _utc_now(), mission_id, step_key))
+            return self._require_step(mission_id, step_key)
 
     @contextlib.contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -164,15 +314,32 @@ class MissionStore:
             raise
 
     def _init_schema(self) -> None:
-        # Inside one write transaction so concurrent first opens cannot both
-        # create the table.
+        # One write transaction covers the version check and any migration:
+        # concurrent opens serialise, and a failure leaves the old version and
+        # schema exactly as they were.
         with self._transaction():
             version = self._conn.execute('PRAGMA user_version').fetchone()[0]
+            if version == SCHEMA_VERSION:
+                return
             if version == 0:
-                self._conn.execute(_SCHEMA)
-                self._conn.execute(f'PRAGMA user_version = {SCHEMA_VERSION}')
-            elif version != SCHEMA_VERSION:
+                self._conn.execute(_MISSIONS_DDL)
+                self._conn.execute(_MISSION_STEPS_DDL)
+            elif version == 1:
+                self._migrate_v1_to_v2()
+            else:
                 raise UnsupportedSchemaVersion(version)
+            self._conn.execute(f'PRAGMA user_version = {SCHEMA_VERSION}')
+
+    def _migrate_v1_to_v2(self) -> None:
+        # SQLite cannot add a NOT NULL column without a default, and a default
+        # would leave migrated databases different from fresh ones. So rebuild
+        # the table. Version 1 kept no lifecycle state, but every mission it
+        # stored had been accepted.
+        self._conn.execute(_RENAME_V1_MISSIONS)
+        self._conn.execute(_MISSIONS_DDL)
+        self._conn.execute(_COPY_V1_MISSIONS, (MissionState.ACCEPTED.value,))
+        self._conn.execute(_DROP_V1_MISSIONS)
+        self._conn.execute(_MISSION_STEPS_DDL)
 
     def _fetch(self, query: str, value: str) -> MissionRecord | None:
         row = self._conn.execute(query, (value,)).fetchone()
@@ -183,3 +350,19 @@ class MissionStore:
         if record is None:
             raise MissionNotFound(value)
         return record
+
+    def _require_mission(self, mission_id: str) -> None:
+        if self._conn.execute(_MISSION_EXISTS, (mission_id,)).fetchone() is None:
+            raise MissionNotFound(mission_id)
+
+    def _fetch_steps(self, mission_id: str) -> tuple[StepRecord, ...]:
+        rows = self._conn.execute(_STEPS_OF_MISSION, (mission_id,)).fetchall()
+        return tuple(_to_step(row) for row in rows)
+
+    def _require_step(self, mission_id: str, step_key: str) -> StepRecord:
+        row = self._conn.execute(_STEP_BY_KEY, (mission_id, step_key)).fetchone()
+        if row is not None:
+            return _to_step(row)
+        # Tell an unknown mission apart from an unknown step.
+        self._require_mission(mission_id)
+        raise StepNotFound(mission_id, step_key)

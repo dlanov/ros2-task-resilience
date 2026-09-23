@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field, InitVar
 from datetime import datetime
 import hashlib
@@ -20,6 +21,7 @@ import math
 from typing import Any
 
 from .errors import InvalidRequest
+from .state_machine import MissionState, StepState
 
 
 def _check_json(value: Any, path: str, active: set[int]) -> None:
@@ -105,5 +107,37 @@ class MissionRecord:
     payload: Any
     max_attempts: int
     attempts_used: int
+    state: MissionState
     created_at: datetime
     updated_at: datetime
+
+
+@dataclass(frozen=True)
+class StepRecord:
+    """A step as stored. A snapshot, like MissionRecord."""
+
+    mission_id: str
+    step_key: str
+    step_index: int
+    state: StepState
+    created_at: datetime
+    updated_at: datetime
+
+
+def validate_step_keys(step_keys: Iterable[str]) -> tuple[str, ...]:
+    # A bare string is iterable and would silently become one step per character.
+    if isinstance(step_keys, (str, bytes)):
+        raise InvalidRequest('step_keys must be a sequence of keys, not a single string')
+    try:
+        keys = tuple(step_keys)
+    except TypeError as exc:
+        raise InvalidRequest('step_keys must be an iterable of keys') from exc
+
+    if not keys:
+        raise InvalidRequest('a mission needs at least one step')
+    for key in keys:
+        if type(key) is not str or not key:
+            raise InvalidRequest(f'step keys must be non-empty strings, got {key!r}')
+    if len(set(keys)) != len(keys):
+        raise InvalidRequest('step keys must be unique within a mission')
+    return keys

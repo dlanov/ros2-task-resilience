@@ -125,17 +125,18 @@ def test_attempt_survives_a_process_that_exits_abruptly(db_path):
 def test_schema_version_is_recorded(db_path):
     MissionStore(db_path).close()
 
-    assert pragma(db_path, 'user_version') == 1
+    assert pragma(db_path, 'user_version') == 2
 
 
-def test_newer_schema_version_is_refused_and_leaves_no_lock_behind(db_path):
+@pytest.mark.parametrize('version', [3, 99, -1])
+def test_unsupported_schema_version_is_refused_and_leaves_no_lock_behind(db_path, version):
     MissionStore(db_path).close()
     with contextlib.closing(sqlite3.connect(db_path)) as conn:
-        conn.execute('PRAGMA user_version = 2')
+        conn.execute(f'PRAGMA user_version = {version}')
 
     with pytest.raises(UnsupportedSchemaVersion) as excinfo:
         MissionStore(db_path)
-    assert excinfo.value.version == 2
+    assert excinfo.value.version == version
 
     # The refused open must have rolled back and closed its connection.
     with contextlib.closing(sqlite3.connect(db_path, timeout=0.1, isolation_level=None)) as conn:

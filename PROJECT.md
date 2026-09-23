@@ -383,9 +383,20 @@ Candidate service:
 
 The first interface set should remain minimal. Do not create messages merely because they may be useful later.
 
-## 12. Proposed persisted data
+## 12. Persisted data
 
 SQLite is the initial persistence mechanism.
+
+### Implemented so far (schema version 2)
+
+The schema version is `PRAGMA user_version`. A version 1 database migrates to version 2 when it is opened.
+
+- `missions`: mission ID, external request ID, request fingerprint and canonical payload, attempt limit and attempts used, `mission_state`, and created/updated timestamps.
+- `mission_steps`: mission ID, caller-supplied stable `step_key`, `step_index` (order), `step_state`, and created/updated timestamps. Nothing else is stored per step yet.
+
+Every state change is validated by the state model (section 13) inside a write transaction.
+
+The concepts below are the longer-term minimum. Only the parts listed above are implemented.
 
 Minimum concepts:
 
@@ -656,7 +667,7 @@ general robot autonomy framework
 
 These should be resolved by implementation evidence rather than speculation:
 
-1. Exact mission/action schema.
+1. Exact mission/action schema. (The persisted mission/step schema is implemented as version 2; the ROS action schema is still open.)
 2. Exact transaction boundaries around Nav2 dispatch.
 3. How much downstream ROS action state can be reconciled after different crash timings.
 4. Whether to expose attempt budgets in the public action interface in v0.1.
@@ -674,7 +685,8 @@ These should be resolved by implementation evidence rather than speculation:
 Phase 1 (section 16) is the current milestone. It proceeds in bounded tasks:
 
 - Task 002, durable mission identity and attempt accounting: **COMPLETE**. A ROS-independent Python core with SQLite storage.
-- Task 003, mission and step state model: **COMPLETE**. Pure state semantics and transition rules, not yet persisted.
+- Task 003, mission and step state model: **COMPLETE**. Pure state semantics and transition rules.
+- Task 004, persistent mission and step state: **COMPLETE**. Mission and step states stored in SQLite (schema version 2), with migration from version 1.
 
 ### M0: Hardware-Free Nav2 Baseline — COMPLETE
 
