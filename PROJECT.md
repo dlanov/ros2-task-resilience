@@ -421,7 +421,7 @@ The implementation should prefer transactions around state transitions that matt
 
 The first version should avoid an excessively complex state machine.
 
-Candidate mission states:
+Mission states (the current v0.1 state model):
 
 ```text
 ACCEPTED
@@ -433,7 +433,7 @@ CANCELLED
 NEEDS_RECONCILIATION
 ```
 
-Candidate step states:
+Step states (the current v0.1 state model):
 
 ```text
 PENDING
@@ -671,7 +671,10 @@ These should be resolved by implementation evidence rather than speculation:
 
 ### Current milestone: Phase 1 — durable mission core
 
-Phase 1 (section 16) is the current milestone. It proceeds in bounded tasks. The first covers durable mission identity and attempt accounting: a ROS-independent Python core with SQLite storage.
+Phase 1 (section 16) is the current milestone. It proceeds in bounded tasks:
+
+- Task 002, durable mission identity and attempt accounting: **COMPLETE**. A ROS-independent Python core with SQLite storage.
+- Task 003, mission and step state model: **COMPLETE**. Pure state semantics and transition rules, not yet persisted.
 
 ### M0: Hardware-Free Nav2 Baseline — COMPLETE
 

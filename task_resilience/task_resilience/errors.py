@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import enum
+
 
 class InvalidRequest(ValueError):
     """The request cannot be accepted as submitted."""
@@ -49,3 +51,23 @@ class UnsupportedSchemaVersion(Exception):
     def __init__(self, version: int) -> None:
         super().__init__(f'unsupported database schema version {version}')
         self.version = version
+
+
+class InvalidStateTransition(Exception):
+    """A state change is not one of the allowed ordinary transitions."""
+
+    def __init__(self, entity: str, current: enum.Enum, target: enum.Enum) -> None:
+        super().__init__(f'{entity} cannot go from {current.value} to {target.value}')
+        self.entity = entity
+        self.current = current
+        self.target = target
+
+
+class MissionCompletionInvariantError(Exception):
+    """A mission cannot complete unless it has steps and every one has succeeded."""
+
+    def __init__(self, current: enum.Enum, step_states: tuple[enum.Enum, ...]) -> None:
+        seen = ', '.join(state.value for state in step_states) or 'none'
+        super().__init__(f'mission cannot complete from {current.value}; step states: {seen}')
+        self.current = current
+        self.step_states = step_states
