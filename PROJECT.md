@@ -495,7 +495,9 @@ These are planning estimates, not targets.
 
 ## 16. Implementation phases
 
-### Phase 0 — prove environment and Nav2 loopback baseline
+### Phase 0 — prove environment and Nav2 loopback baseline — COMPLETE
+
+Completed as milestone M0 (tag `m0-hardware-free-baseline`).
 
 No Task Resilience logic yet.
 
@@ -507,7 +509,7 @@ Deliverable:
 - goal can complete headlessly;
 - environment/version information captured.
 
-### Phase 1 — pure mission core
+### Phase 1 — pure mission core — CURRENT
 
 Implement:
 
@@ -605,7 +607,7 @@ Initial governance:
 
 An open-source license permits forks; repository maintainership and project direction remain separate from the rights granted by the license.
 
-Apache-2.0 is the current preferred license because it is common in ROS 2, but the final license decision should be made before public release.
+The project is licensed under Apache-2.0, which is common in ROS 2. See `LICENSE`.
 
 ## 19. ROS ecosystem strategy
 
@@ -662,14 +664,20 @@ These should be resolved by implementation evidence rather than speculation:
 6. Whether the supervisor should be a managed lifecycle node in v0.1.
 7. Final project/repository/package names.
 8. Minimum supported ROS 2 distributions beyond Jazzy.
-9. Final licensing choice.
+9. ~~Final licensing choice.~~ Resolved: Apache-2.0.
 10. Which failure semantics belong in the generic core versus the Nav2 adapter.
 
-## 22. Immediate next milestone
+## 22. Milestones
 
-**Milestone M0: Hardware-Free Nav2 Baseline**
+### Current milestone: Phase 1 — durable mission core
 
-Before writing the mission runtime, establish a reproducible headless WSL baseline:
+Phase 1 (section 16) is the current milestone. It proceeds in bounded tasks. The first covers durable mission identity and attempt accounting: a ROS-independent Python core with SQLite storage.
+
+### M0: Hardware-Free Nav2 Baseline — COMPLETE
+
+Baseline tag: `m0-hardware-free-baseline`.
+
+Before writing the mission runtime, a reproducible headless WSL baseline was established:
 
 - ROS 2 Jazzy sourced;
 - `nav2_bringup` available;
@@ -680,7 +688,7 @@ Before writing the mission runtime, establish a reproducible headless WSL baseli
 - the goal reaches a terminal result;
 - commands and observed versions are recorded.
 
-Once M0 is green, begin Phase 1.
+M0 is green; Phase 1 has begun.
 
 ## 23. References used to define the current plan
 
