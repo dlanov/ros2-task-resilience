@@ -21,11 +21,14 @@ import pytest
 
 from task_resilience.errors import (
     AttemptLimitReached,
+    DispatchNotFound,
+    DispatchPreparationRequired,
     IdempotencyConflict,
     InvalidStateTransition,
     MissionCompletionInvariantError,
     StepDefinitionConflict,
 )
+from task_resilience.model import DispatchRecord
 from task_resilience.state_machine import MissionState, StepState
 from task_resilience.storage import MissionStore
 
@@ -162,7 +165,7 @@ def test_concurrent_first_open_creates_the_schema_once(tmp_path):
                 future.result(timeout=TIMEOUT)
 
         with contextlib.closing(sqlite3.connect(path)) as conn:
-            assert conn.execute('PRAGMA user_version').fetchone()[0] == 2
+            assert conn.execute('PRAGMA user_version').fetchone()[0] == 3
 
 
 def test_lock_timeout_surfaces_and_consumes_nothing(db_path):
@@ -189,8 +192,8 @@ def missions_with_an_executing_step(db_path, count, running=False):
         for n in range(count):
             mission = store.create_or_get(f'req-{n}', {'n': n}, 3)
             store.initialize_steps(mission.mission_id, ['checkpoint'])
-            for state in (StepState.DISPATCH_PREPARED, StepState.DISPATCHED,
-                          StepState.ACCEPTED, StepState.EXECUTING):
+            store.prepare_step_dispatch(mission.mission_id, 'checkpoint')
+            for state in (StepState.DISPATCHED, StepState.ACCEPTED, StepState.EXECUTING):
                 store.transition_step_state(mission.mission_id, 'checkpoint', state)
             if running:
                 store.transition_mission_state(mission.mission_id, MissionState.RUNNING)
@@ -333,3 +336,122 @@ def test_concurrent_identical_step_definitions_create_one_list(db_path):
             assert {worker[n] for worker in results} == {store.get_steps(mission_id)}
     with contextlib.closing(sqlite3.connect(db_path)) as conn:
         assert conn.execute('SELECT COUNT(*) FROM mission_steps').fetchone()[0] == 3 * ROUNDS
+
+
+def missions_with_a_pending_step(db_path, count):
+    with MissionStore(db_path) as store:
+        mission_ids = []
+        for n in range(count):
+            mission = store.create_or_get(f'req-{n}', {'n': n}, 3)
+            store.initialize_steps(mission.mission_id, ['checkpoint'])
+            mission_ids.append(mission.mission_id)
+    return mission_ids
+
+
+def test_concurrent_preparation_of_one_step_gives_everyone_the_same_dispatch(db_path):
+    workers = 8
+    mission_ids = missions_with_a_pending_step(db_path, ROUNDS)
+
+    results = run_concurrently(
+        db_path, workers, ROUNDS,
+        lambda store, worker, n: store.prepare_step_dispatch(mission_ids[n], 'checkpoint'))
+
+    with MissionStore(db_path) as store:
+        for n, mission_id in enumerate(mission_ids):
+            records = [worker[n] for worker in results]
+            assert len(set(records)) == 1, f'round {n}: {records}'
+            assert store.get_step_dispatch(mission_id, 'checkpoint') == records[0]
+            assert store.get_step(mission_id, 'checkpoint').state is StepState.DISPATCH_PREPARED
+    with contextlib.closing(sqlite3.connect(db_path)) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM step_dispatches').fetchone()[0] == ROUNDS
+        assert conn.execute(
+            'SELECT COUNT(DISTINCT dispatch_id) FROM step_dispatches').fetchone()[0] == ROUNDS
+
+
+def test_a_dispatch_exists_exactly_when_preparation_won_the_race_with_a_cancellation(db_path):
+    mission_ids = missions_with_a_pending_step(db_path, ROUNDS)
+
+    def act(store, worker, n):
+        if worker == 0:
+            try:
+                return store.prepare_step_dispatch(mission_ids[n], 'checkpoint')
+            except InvalidStateTransition as refusal:
+                return refusal
+        return store.transition_step_state(mission_ids[n], 'checkpoint', StepState.CANCELLED)
+
+    results = run_concurrently(db_path, 2, ROUNDS, act)
+
+    prepared_first = 0
+    with MissionStore(db_path) as store:
+        for n, mission_id in enumerate(mission_ids):
+            preparation, cancellation = results[0][n], results[1][n]
+
+            # CANCELLED is legal from PENDING and from DISPATCH_PREPARED, so the
+            # cancellation always lands, before or after the preparation.
+            assert cancellation.state is StepState.CANCELLED, f'round {n}'
+            assert store.get_step(mission_id, 'checkpoint').state is StepState.CANCELLED
+
+            if isinstance(preparation, DispatchRecord):
+                # Preparation committed first, then the cancellation followed the
+                # state machine. The dispatch row stays: it records that
+                # preparation happened, and the request may have been sent.
+                prepared_first += 1
+                assert store.get_step_dispatch(mission_id, 'checkpoint') == preparation
+            else:
+                assert isinstance(preparation, InvalidStateTransition), f'round {n}'
+                assert preparation.current is StepState.CANCELLED
+                assert preparation.target is StepState.DISPATCH_PREPARED
+                with pytest.raises(DispatchNotFound):
+                    store.get_step_dispatch(mission_id, 'checkpoint')
+
+    # The invariants, read straight from storage.
+    with contextlib.closing(sqlite3.connect(db_path)) as conn:
+        def count(sql):
+            return conn.execute(sql).fetchone()[0]
+
+        assert count("""
+            SELECT COUNT(*) FROM mission_steps s JOIN step_dispatches d
+              ON d.mission_id = s.mission_id AND d.step_key = s.step_key
+            WHERE s.step_state = 'PENDING'""") == 0
+        assert count("""
+            SELECT COUNT(*) FROM mission_steps s
+            WHERE s.step_state = 'DISPATCH_PREPARED' AND NOT EXISTS (
+                SELECT 1 FROM step_dispatches d
+                WHERE d.mission_id = s.mission_id AND d.step_key = s.step_key)""") == 0
+        assert count('SELECT COUNT(*) FROM step_dispatches') == prepared_first
+
+
+def test_a_direct_transition_racing_preparation_cannot_leave_an_orphan_prepared_step(db_path):
+    workers = 4
+    mission_ids = missions_with_a_pending_step(db_path, ROUNDS)
+
+    def act(store, worker, n):
+        if worker % 2 == 0:
+            return store.prepare_step_dispatch(mission_ids[n], 'checkpoint')
+        try:
+            store.transition_step_state(mission_ids[n], 'checkpoint', StepState.DISPATCH_PREPARED)
+        except DispatchPreparationRequired as refusal:
+            return refusal
+        return None
+
+    results = run_concurrently(db_path, workers, ROUNDS, act)
+
+    with MissionStore(db_path) as store:
+        for n, mission_id in enumerate(mission_ids):
+            outcomes = [worker[n] for worker in results]
+            prepared = [o for o in outcomes if isinstance(o, DispatchRecord)]
+            refused = [o for o in outcomes if isinstance(o, DispatchPreparationRequired)]
+            # Only preparation ever succeeds, and everyone who prepared got one ID.
+            assert len(prepared) == 2 and len(refused) == 2, f'round {n}: {outcomes}'
+            assert len(set(prepared)) == 1
+            assert store.get_step(mission_id, 'checkpoint').state is StepState.DISPATCH_PREPARED
+            assert store.get_step_dispatch(mission_id, 'checkpoint') == prepared[0]
+
+    with contextlib.closing(sqlite3.connect(db_path)) as conn:
+        assert conn.execute("""
+            SELECT COUNT(*) FROM mission_steps s
+            WHERE s.step_state = 'DISPATCH_PREPARED' AND NOT EXISTS (
+                SELECT 1 FROM step_dispatches d
+                WHERE d.mission_id = s.mission_id AND d.step_key = s.step_key)
+            """).fetchone()[0] == 0
+        assert conn.execute('SELECT COUNT(*) FROM step_dispatches').fetchone()[0] == ROUNDS

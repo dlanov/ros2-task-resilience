@@ -125,10 +125,10 @@ def test_attempt_survives_a_process_that_exits_abruptly(db_path):
 def test_schema_version_is_recorded(db_path):
     MissionStore(db_path).close()
 
-    assert pragma(db_path, 'user_version') == 2
+    assert pragma(db_path, 'user_version') == 3
 
 
-@pytest.mark.parametrize('version', [3, 99, -1])
+@pytest.mark.parametrize('version', [4, 99, -1])
 def test_unsupported_schema_version_is_refused_and_leaves_no_lock_behind(db_path, version):
     MissionStore(db_path).close()
     with contextlib.closing(sqlite3.connect(db_path)) as conn:

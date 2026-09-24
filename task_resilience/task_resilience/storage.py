@@ -24,22 +24,36 @@ import uuid
 
 from .errors import (
     AttemptLimitReached,
+    CorruptDispatchRecord,
     CorruptStoredState,
+    DispatchNotFound,
+    DispatchPreparationRequired,
     IdempotencyConflict,
     MissionNotFound,
     StepDefinitionConflict,
     StepNotFound,
     UnsupportedSchemaVersion,
 )
-from .model import MissionRecord, MissionRequest, StepRecord, validate_step_keys
+from .model import DispatchRecord, MissionRecord, MissionRequest, StepRecord, validate_step_keys
 from .state_machine import MissionState, StepState, transition_mission, transition_step
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _State = TypeVar('_State', bound=enum.Enum)
 
+# States in which a step's external request may exist, so each needs a dispatch
+# identity. The finished and unknown states are not listed: a version 2
+# database legitimately holds those without one.
+_IN_FLIGHT = frozenset({
+    StepState.DISPATCH_PREPARED,
+    StepState.DISPATCHED,
+    StepState.ACCEPTED,
+    StepState.EXECUTING,
+    StepState.CANCEL_REQUESTED,
+})
+
 # The state lists are spelled out rather than built from the enums: this is
-# what schema version 2 is. A new state needs a new schema version, and a test
+# what the schema is. A new state needs a new schema version, and a test
 # compares these lists with the enums.
 #
 # request_json is the canonical payload only; max_attempts has its own column.
@@ -74,6 +88,22 @@ CREATE TABLE mission_steps (
     updated_at  TEXT NOT NULL,
     PRIMARY KEY (mission_id, step_key),
     UNIQUE (mission_id, step_index)
+)
+"""
+
+# The dispatch identity is kept apart from mission_steps so that version 2
+# steps keep their schema and migrated steps are not given made-up IDs. The
+# step's own state stays the lifecycle; this table only reserves the ID.
+_STEP_DISPATCHES_DDL = """
+CREATE TABLE step_dispatches (
+    dispatch_id TEXT NOT NULL PRIMARY KEY,
+    mission_id  TEXT NOT NULL,
+    step_key    TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    FOREIGN KEY (mission_id, step_key)
+        REFERENCES mission_steps (mission_id, step_key)
+        ON DELETE CASCADE,
+    UNIQUE (mission_id, step_key)
 )
 """
 
@@ -128,6 +158,14 @@ UPDATE mission_steps SET step_state = ?, updated_at = ?
 WHERE mission_id = ? AND step_key = ?
 """
 
+_DISPATCHES_OF_STEP = 'SELECT * FROM step_dispatches WHERE mission_id = ? AND step_key = ?'
+_DISPATCH_BY_ID = 'SELECT * FROM step_dispatches WHERE dispatch_id = ?'
+
+_INSERT_DISPATCH = """
+INSERT INTO step_dispatches (dispatch_id, mission_id, step_key, created_at)
+VALUES (?, ?, ?, ?)
+"""
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec='microseconds')
@@ -169,6 +207,26 @@ def _to_step(row: sqlite3.Row) -> StepRecord:
         state=_parse_state(StepState, row['step_state'], 'step', row['mission_id']),
         created_at=datetime.fromisoformat(row['created_at']),
         updated_at=datetime.fromisoformat(row['updated_at']),
+    )
+
+
+def _to_dispatch(row: sqlite3.Row) -> DispatchRecord:
+    stored = row['dispatch_id']
+    # Only the canonical text this code writes is accepted. Anything else means
+    # the row was changed behind our back, and a lookup by ID would not find it.
+    try:
+        dispatch_id = uuid.UUID(stored)
+    except (ValueError, TypeError, AttributeError):
+        dispatch_id = None
+    if dispatch_id is None or str(dispatch_id) != stored:
+        raise CorruptDispatchRecord(
+            row['mission_id'], row['step_key'], 'stored dispatch ID is not a canonical UUID',
+            stored)
+    return DispatchRecord(
+        dispatch_id=dispatch_id,
+        mission_id=row['mission_id'],
+        step_key=row['step_key'],
+        created_at=datetime.fromisoformat(row['created_at']),
     )
 
 
@@ -287,8 +345,19 @@ class MissionStore:
         self, mission_id: str, step_key: str, target: StepState,
     ) -> StepRecord:
         _require_kind(target, StepState, 'target')
+        # DISPATCH_PREPARED only ever comes with a dispatch ID, written in the
+        # same transaction: that is prepare_step_dispatch. Refuse it for every
+        # current state, so the mistake shows up whatever the timing.
+        if target is StepState.DISPATCH_PREPARED:
+            raise DispatchPreparationRequired(mission_id, step_key)
         with self._transaction():
             step = self._require_step(mission_id, step_key)
+            # An in-flight step migrated from version 2 has no dispatch identity,
+            # and none is made up for it. Nothing moves it on, whatever the
+            # target, until a later reconciliation resolves it.
+            if step.state in _IN_FLIGHT and self._fetch_dispatch(mission_id, step_key) is None:
+                raise CorruptDispatchRecord(
+                    mission_id, step_key, f'step is {step.state.value} but has no dispatch')
             new_state = transition_step(step.state, target)
             if new_state is step.state:
                 return step
@@ -296,6 +365,45 @@ class MissionStore:
             self._conn.execute(
                 _SET_STEP_STATE, (new_state.value, _utc_now(), mission_id, step_key))
             return self._require_step(mission_id, step_key)
+
+    def prepare_step_dispatch(self, mission_id: str, step_key: str) -> DispatchRecord:
+        with self._transaction():
+            step = self._require_step(mission_id, step_key)
+            # The state machine decides. The same state means this is a replay,
+            # a legal move is the first preparation, and anything else (a step
+            # already past preparation, or finished) is refused here too.
+            new_state = transition_step(step.state, StepState.DISPATCH_PREPARED)
+            existing = self._fetch_dispatch(mission_id, step_key)
+
+            if new_state is step.state:
+                if existing is None:
+                    raise CorruptDispatchRecord(
+                        mission_id, step_key, f'step is {step.state.value} but has no dispatch')
+                return existing
+            if existing is not None:
+                raise CorruptDispatchRecord(
+                    mission_id, step_key, f'step is {step.state.value} but already has a dispatch',
+                    str(existing.dispatch_id))
+
+            # The ID and the state change commit together. Once this commits an
+            # adapter may act on the ID; if it never does, nothing was reserved.
+            dispatch_id = uuid.uuid4()
+            now = _utc_now()
+            self._conn.execute(_INSERT_DISPATCH, (str(dispatch_id), mission_id, step_key, now))
+            self._conn.execute(_SET_STEP_STATE, (new_state.value, now, mission_id, step_key))
+            return self._require_dispatch(mission_id, step_key)
+
+    def get_step_dispatch(self, mission_id: str, step_key: str) -> DispatchRecord:
+        self._require_step(mission_id, step_key)
+        return self._require_dispatch(mission_id, step_key)
+
+    def get_dispatch(self, dispatch_id: uuid.UUID) -> DispatchRecord:
+        if not isinstance(dispatch_id, uuid.UUID):
+            raise TypeError(f'dispatch_id must be a uuid.UUID, got {dispatch_id!r}')
+        row = self._conn.execute(_DISPATCH_BY_ID, (str(dispatch_id),)).fetchone()
+        if row is None:
+            raise DispatchNotFound(dispatch_id=dispatch_id)
+        return _to_dispatch(row)
 
     @contextlib.contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -324,8 +432,13 @@ class MissionStore:
             if version == 0:
                 self._conn.execute(_MISSIONS_DDL)
                 self._conn.execute(_MISSION_STEPS_DDL)
-            elif version == 1:
-                self._migrate_v1_to_v2()
+                self._conn.execute(_STEP_DISPATCHES_DDL)
+            elif version in (1, 2):
+                # A version 1 database goes through both steps inside this one
+                # transaction, so version 2 is never committed on the way.
+                if version == 1:
+                    self._migrate_v1_to_v2()
+                self._migrate_v2_to_v3()
             else:
                 raise UnsupportedSchemaVersion(version)
             self._conn.execute(f'PRAGMA user_version = {SCHEMA_VERSION}')
@@ -340,6 +453,11 @@ class MissionStore:
         self._conn.execute(_COPY_V1_MISSIONS, (MissionState.ACCEPTED.value,))
         self._conn.execute(_DROP_V1_MISSIONS)
         self._conn.execute(_MISSION_STEPS_DDL)
+
+    def _migrate_v2_to_v3(self) -> None:
+        # Existing steps get no dispatch: none of them was prepared through this
+        # code, and an ID would be invented.
+        self._conn.execute(_STEP_DISPATCHES_DDL)
 
     def _fetch(self, query: str, value: str) -> MissionRecord | None:
         row = self._conn.execute(query, (value,)).fetchone()
@@ -366,3 +484,16 @@ class MissionStore:
         # Tell an unknown mission apart from an unknown step.
         self._require_mission(mission_id)
         raise StepNotFound(mission_id, step_key)
+
+    def _fetch_dispatch(self, mission_id: str, step_key: str) -> DispatchRecord | None:
+        rows = self._conn.execute(_DISPATCHES_OF_STEP, (mission_id, step_key)).fetchall()
+        if len(rows) > 1:
+            raise CorruptDispatchRecord(
+                mission_id, step_key, 'more than one dispatch for the step', len(rows))
+        return _to_dispatch(rows[0]) if rows else None
+
+    def _require_dispatch(self, mission_id: str, step_key: str) -> DispatchRecord:
+        dispatch = self._fetch_dispatch(mission_id, step_key)
+        if dispatch is None:
+            raise DispatchNotFound(mission_id=mission_id, step_key=step_key)
+        return dispatch

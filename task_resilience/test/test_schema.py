@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import re
 import sqlite3
 
@@ -21,6 +22,17 @@ from task_resilience.state_machine import MissionState, StepState
 from task_resilience.storage import MissionStore
 
 TIMESTAMP = '2026-01-01T00:00:00.000000+00:00'
+
+STEP_DISPATCHES_DDL = """CREATE TABLE step_dispatches (
+    dispatch_id TEXT NOT NULL PRIMARY KEY,
+    mission_id  TEXT NOT NULL,
+    step_key    TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    FOREIGN KEY (mission_id, step_key)
+        REFERENCES mission_steps (mission_id, step_key)
+        ON DELETE CASCADE,
+    UNIQUE (mission_id, step_key)
+)"""
 
 
 @pytest.fixture
@@ -53,6 +65,13 @@ def insert_step(conn, mission_id='m1', key='a', index=0, state='PENDING'):
         (mission_id, key, index, state, TIMESTAMP, TIMESTAMP))
 
 
+def insert_dispatch(conn, dispatch_id='d1', mission_id='m1', key='a'):
+    conn.execute(
+        'INSERT INTO step_dispatches (dispatch_id, mission_id, step_key, created_at)'
+        ' VALUES (?, ?, ?, ?)',
+        (dispatch_id, mission_id, key, TIMESTAMP))
+
+
 def columns(conn, table):
     return [row[1] for row in conn.execute(f'PRAGMA table_info({table})')]
 
@@ -64,16 +83,22 @@ def check_list(conn, table, column):
     return re.findall(r"'([^']*)'", match.group(1))
 
 
-def test_fresh_database_is_created_at_version_2(conn):
-    assert conn.execute('PRAGMA user_version').fetchone()[0] == 2
+def test_fresh_database_is_created_at_version_3(conn):
+    assert conn.execute('PRAGMA user_version').fetchone()[0] == 3
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert tables == {'missions', 'mission_steps'}
+    assert tables == {'missions', 'mission_steps', 'step_dispatches'}
 
 
 def test_missions_table_gains_only_mission_state(conn):
     assert columns(conn, 'missions') == [
         'mission_id', 'request_id', 'request_fingerprint', 'request_json', 'max_attempts',
         'attempts_used', 'created_at', 'updated_at', 'mission_state',
+    ]
+
+
+def test_step_dispatches_table_holds_only_the_identity(conn):
+    assert columns(conn, 'step_dispatches') == [
+        'dispatch_id', 'mission_id', 'step_key', 'created_at',
     ]
 
 
@@ -195,3 +220,115 @@ def test_deleting_a_mission_deletes_its_steps(conn):
 
     remaining = conn.execute('SELECT mission_id FROM mission_steps').fetchall()
     assert remaining == [('m2',)]
+
+
+# Dispatches
+
+@pytest.fixture
+def prepared(conn):
+    """Give the connection a mission with two steps, so dispatches have something to reference."""
+    insert_mission(conn, 'm1')
+    insert_step(conn, 'm1', key='a', index=0)
+    insert_step(conn, 'm1', key='b', index=1)
+    return conn
+
+
+def test_step_dispatches_ddl_is_exactly_as_specified(conn):
+    sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'step_dispatches'").fetchone()[0]
+
+    assert sql == STEP_DISPATCHES_DDL
+
+
+def test_dispatch_id_is_a_required_primary_key(conn):
+    info = {row[1]: row for row in conn.execute('PRAGMA table_info(step_dispatches)')}
+
+    # (cid, name, type, notnull, default, pk)
+    assert info['dispatch_id'][2:] == ('TEXT', 1, None, 1)
+
+
+def test_a_null_dispatch_id_is_rejected(prepared):
+    with pytest.raises(sqlite3.IntegrityError, match='NOT NULL'):
+        insert_dispatch(prepared, None, 'm1', 'a')
+
+    insert_dispatch(prepared, 'd1', 'm1', 'a')
+    with pytest.raises(sqlite3.IntegrityError, match='NOT NULL'):
+        prepared.execute('UPDATE step_dispatches SET dispatch_id = NULL')
+
+    assert prepared.execute('SELECT dispatch_id FROM step_dispatches').fetchall() == [('d1',)]
+
+
+def test_a_dispatch_can_be_recorded_for_a_step(prepared):
+    insert_dispatch(prepared, 'd1', 'm1', 'a')
+
+    assert prepared.execute('SELECT * FROM step_dispatches').fetchall() == [
+        ('d1', 'm1', 'a', TIMESTAMP)]
+
+
+def test_dispatch_id_is_unique(prepared):
+    insert_dispatch(prepared, 'd1', 'm1', 'a')
+
+    with pytest.raises(sqlite3.IntegrityError):
+        insert_dispatch(prepared, 'd1', 'm1', 'b')
+
+
+def test_a_step_can_have_only_one_dispatch(prepared):
+    insert_dispatch(prepared, 'd1', 'm1', 'a')
+
+    with pytest.raises(sqlite3.IntegrityError):
+        insert_dispatch(prepared, 'd2', 'm1', 'a')
+
+
+def test_different_steps_have_different_dispatches(prepared):
+    insert_dispatch(prepared, 'd1', 'm1', 'a')
+    insert_dispatch(prepared, 'd2', 'm1', 'b')
+
+    assert prepared.execute('SELECT COUNT(*) FROM step_dispatches').fetchone()[0] == 2
+
+
+@pytest.mark.parametrize(('mission_id', 'key'), [
+    ('m1', 'no-such-step'),
+    ('no-such-mission', 'a'),
+    ('no-such-mission', 'no-such-step'),
+], ids=['unknown step', 'unknown mission', 'neither'])
+def test_a_dispatch_cannot_reference_an_unknown_step(prepared, mission_id, key):
+    with pytest.raises(sqlite3.IntegrityError):
+        insert_dispatch(prepared, 'd1', mission_id, key)
+
+
+def test_a_dispatch_cannot_borrow_another_missions_step(prepared):
+    insert_mission(prepared, 'm2')
+
+    with pytest.raises(sqlite3.IntegrityError):
+        insert_dispatch(prepared, 'd1', 'm2', 'a')
+
+
+def test_deleting_a_step_deletes_its_dispatch(prepared):
+    insert_dispatch(prepared, 'd1', 'm1', 'a')
+    insert_dispatch(prepared, 'd2', 'm1', 'b')
+
+    prepared.execute("DELETE FROM mission_steps WHERE step_key = 'a'")
+
+    assert prepared.execute('SELECT dispatch_id FROM step_dispatches').fetchall() == [('d2',)]
+
+
+def test_deleting_a_mission_deletes_its_steps_and_their_dispatches(prepared):
+    insert_mission(prepared, 'm2')
+    insert_step(prepared, 'm2', key='a', index=0)
+    insert_dispatch(prepared, 'd1', 'm1', 'a')
+    insert_dispatch(prepared, 'd2', 'm1', 'b')
+    insert_dispatch(prepared, 'd3', 'm2', 'a')
+
+    prepared.execute("DELETE FROM missions WHERE mission_id = 'm1'")
+
+    assert prepared.execute('SELECT dispatch_id FROM step_dispatches').fetchall() == [('d3',)]
+    assert prepared.execute('SELECT mission_id FROM mission_steps').fetchall() == [('m2',)]
+
+
+def test_defining_steps_creates_no_dispatch(db_path):
+    with MissionStore(db_path) as store:
+        mission = store.create_or_get('req-001', {}, 1)
+        store.initialize_steps(mission.mission_id, ['a', 'b'])
+
+    with contextlib.closing(sqlite3.connect(db_path)) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM step_dispatches').fetchone()[0] == 0

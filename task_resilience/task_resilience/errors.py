@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import enum
+import uuid
 
 
 class InvalidRequest(ValueError):
@@ -107,3 +108,47 @@ class CorruptStoredState(Exception):
         self.entity = entity
         self.mission_id = mission_id
         self.value = value
+
+
+class DispatchNotFound(Exception):
+    """A step has no dispatch, or no dispatch has this ID."""
+
+    # A lookup by step sets mission_id and step_key; a lookup by ID sets dispatch_id.
+    def __init__(
+        self,
+        *,
+        mission_id: str | None = None,
+        step_key: str | None = None,
+        dispatch_id: uuid.UUID | None = None,
+    ) -> None:
+        if dispatch_id is not None:
+            super().__init__(f'no dispatch {dispatch_id}')
+        else:
+            super().__init__(f'step {step_key!r} of mission {mission_id!r} has no dispatch')
+        self.mission_id = mission_id
+        self.step_key = step_key
+        self.dispatch_id = dispatch_id
+
+
+class CorruptDispatchRecord(Exception):
+    """A step's dispatch record is missing, duplicated, or unreadable for its state."""
+
+    def __init__(
+        self, mission_id: str, step_key: str, reason: str, value: object = None,
+    ) -> None:
+        super().__init__(f'dispatch of step {step_key!r} of mission {mission_id!r}: {reason}')
+        self.mission_id = mission_id
+        self.step_key = step_key
+        self.reason = reason
+        self.value = value
+
+
+class DispatchPreparationRequired(Exception):
+    """A step can enter DISPATCH_PREPARED only through prepare_step_dispatch."""
+
+    def __init__(self, mission_id: str, step_key: str) -> None:
+        super().__init__(
+            f'step {step_key!r} of mission {mission_id!r} must be prepared with '
+            'prepare_step_dispatch, not a plain state transition')
+        self.mission_id = mission_id
+        self.step_key = step_key

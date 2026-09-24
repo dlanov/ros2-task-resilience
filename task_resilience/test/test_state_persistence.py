@@ -26,6 +26,7 @@ from task_resilience import storage
 from task_resilience.errors import (
     AttemptLimitReached,
     CorruptStoredState,
+    DispatchPreparationRequired,
     InvalidStateTransition,
     MissionCompletionInvariantError,
     MissionNotFound,
@@ -80,7 +81,11 @@ def running(store, mission):
 
 def drive(store, mission_id, key, state):
     for step in ROUTE_TO[state]:
-        store.transition_step_state(mission_id, key, step)
+        if step is S.DISPATCH_PREPARED:
+            # The one state a plain transition cannot enter.
+            store.prepare_step_dispatch(mission_id, key)
+        else:
+            store.transition_step_state(mission_id, key, step)
 
 
 def corrupt(db_path, sql):
@@ -175,12 +180,12 @@ def test_unknown_mission_cannot_change_state(store):
 # Steps
 
 def test_step_state_change_is_persisted_and_stamped(store, mission):
+    store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
     before = store.get_step(mission.mission_id, 'checkpoint_a')
 
-    updated = store.transition_step_state(
-        mission.mission_id, 'checkpoint_a', S.DISPATCH_PREPARED)
+    updated = store.transition_step_state(mission.mission_id, 'checkpoint_a', S.DISPATCHED)
 
-    assert updated.state is S.DISPATCH_PREPARED
+    assert updated.state is S.DISPATCHED
     assert updated.updated_at > before.updated_at
     assert updated.created_at == before.created_at
     assert updated.step_index == before.step_index
@@ -189,9 +194,10 @@ def test_step_state_change_is_persisted_and_stamped(store, mission):
 
 
 def test_step_same_state_is_a_no_op_that_keeps_updated_at(store, mission):
-    moved = store.transition_step_state(mission.mission_id, 'checkpoint_a', S.DISPATCH_PREPARED)
+    store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+    moved = store.transition_step_state(mission.mission_id, 'checkpoint_a', S.DISPATCHED)
 
-    replay = store.transition_step_state(mission.mission_id, 'checkpoint_a', S.DISPATCH_PREPARED)
+    replay = store.transition_step_state(mission.mission_id, 'checkpoint_a', S.DISPATCHED)
 
     assert replay == moved
     assert store.get_step(mission.mission_id, 'checkpoint_a') == moved
@@ -230,16 +236,16 @@ def test_step_target_must_be_a_step_state(store, mission, target):
 
 def test_unknown_mission_or_step_cannot_change_state(store, mission):
     with pytest.raises(MissionNotFound):
-        store.transition_step_state('no-such-mission', 'checkpoint_a', S.DISPATCH_PREPARED)
+        store.transition_step_state('no-such-mission', 'checkpoint_a', S.CANCELLED)
     with pytest.raises(StepNotFound) as excinfo:
-        store.transition_step_state(mission.mission_id, 'no_such_step', S.DISPATCH_PREPARED)
+        store.transition_step_state(mission.mission_id, 'no_such_step', S.CANCELLED)
 
     assert excinfo.value.mission_id == mission.mission_id
     assert excinfo.value.step_key == 'no_such_step'
 
 
 def test_step_changes_leave_the_mission_row_alone(store, running):
-    store.transition_step_state(running.mission_id, 'checkpoint_a', S.DISPATCH_PREPARED)
+    store.transition_step_state(running.mission_id, 'checkpoint_a', S.CANCELLED)
 
     assert store.get_by_mission_id(running.mission_id) == running
 
@@ -266,7 +272,7 @@ def test_a_state_machine_refusal_is_propagated_and_nothing_is_written(
     with monkeypatch.context() as patch:
         patch.setattr(storage, 'transition_step', refuse)
         with pytest.raises(InvalidStateTransition):
-            store.transition_step_state(mission.mission_id, 'checkpoint_a', S.DISPATCH_PREPARED)
+            store.transition_step_state(mission.mission_id, 'checkpoint_a', S.CANCELLED)
 
     assert store.get_step(mission.mission_id, 'checkpoint_a').state is S.PENDING
 
@@ -279,8 +285,7 @@ def test_mission_and_step_state_survive_reopening_the_store(db_path):
         assert mission.state is M.ACCEPTED
         store.initialize_steps(mission.mission_id, KEYS)
         store.transition_mission_state(mission.mission_id, M.RUNNING)
-        for state in (S.DISPATCH_PREPARED, S.DISPATCHED, S.ACCEPTED, S.EXECUTING, S.SUCCEEDED):
-            store.transition_step_state(mission.mission_id, 'checkpoint_a', state)
+        drive(store, mission.mission_id, 'checkpoint_a', S.SUCCEEDED)
         store.consume_attempt(mission.mission_id)
         before = (store.get_by_mission_id(mission.mission_id), store.get_steps(mission.mission_id))
 
@@ -317,7 +322,7 @@ from task_resilience.state_machine import StepState
 from task_resilience.storage import MissionStore
 
 store = MissionStore(sys.argv[1])
-store.transition_step_state(sys.argv[2], 'checkpoint_a', StepState.DISPATCH_PREPARED)
+store.transition_step_state(sys.argv[2], 'checkpoint_a', StepState.CANCELLED)
 # Die without closing the store or running any cleanup.
 os._exit(0)
 """
@@ -337,7 +342,7 @@ def test_a_state_change_survives_a_process_that_exits_abruptly(db_path):
     )
 
     with MissionStore(db_path) as reopened:
-        assert reopened.get_step(mission.mission_id, 'checkpoint_a').state is S.DISPATCH_PREPARED
+        assert reopened.get_step(mission.mission_id, 'checkpoint_a').state is S.CANCELLED
 
 
 # Completion invariant through storage
@@ -426,9 +431,13 @@ def test_no_ordinary_transition_leaves_an_unknown_step_outcome(store, running):
     drive(store, running.mission_id, 'checkpoint_a', S.OUTCOME_UNKNOWN)
 
     for target in S:
-        if target is not S.OUTCOME_UNKNOWN:
-            with pytest.raises(InvalidStateTransition):
-                store.transition_step_state(running.mission_id, 'checkpoint_a', target)
+        if target is S.OUTCOME_UNKNOWN:
+            continue
+        # DISPATCH_PREPARED has its own refusal, ahead of the state machine.
+        refusal = (DispatchPreparationRequired if target is S.DISPATCH_PREPARED
+                   else InvalidStateTransition)
+        with pytest.raises(refusal):
+            store.transition_step_state(running.mission_id, 'checkpoint_a', target)
 
     assert store.get_step(running.mission_id, 'checkpoint_a').state is S.OUTCOME_UNKNOWN
 
@@ -496,7 +505,7 @@ def test_an_unknown_stored_step_state_is_an_error_not_a_guess(store, mission, db
     with pytest.raises(CorruptStoredState):
         store.get_steps(mission.mission_id)
     with pytest.raises(CorruptStoredState):
-        store.transition_step_state(mission.mission_id, 'checkpoint_a', S.DISPATCH_PREPARED)
+        store.transition_step_state(mission.mission_id, 'checkpoint_a', S.CANCELLED)
     # The mission decision reads every step, so it refuses to guess as well.
     with pytest.raises(CorruptStoredState):
         store.transition_mission_state(mission.mission_id, M.RUNNING)

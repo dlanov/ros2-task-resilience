@@ -387,14 +387,32 @@ The first interface set should remain minimal. Do not create messages merely bec
 
 SQLite is the initial persistence mechanism.
 
-### Implemented so far (schema version 2)
+### Implemented so far (schema version 3)
 
-The schema version is `PRAGMA user_version`. A version 1 database migrates to version 2 when it is opened.
+The schema version is `PRAGMA user_version`. A version 1 or version 2 database migrates to version 3 when it is opened, in one transaction.
 
 - `missions`: mission ID, external request ID, request fingerprint and canonical payload, attempt limit and attempts used, `mission_state`, and created/updated timestamps.
 - `mission_steps`: mission ID, caller-supplied stable `step_key`, `step_index` (order), `step_state`, and created/updated timestamps. Nothing else is stored per step yet.
+- `step_dispatches`: the durable dispatch UUID of a step, with the mission ID, step key and creation time. At most one per step. A step that was never prepared through the store has none.
 
 Every state change is validated by the state model (section 13) inside a write transaction.
+
+### Dispatch identity
+
+Preparing a step for dispatch reserves a durable UUID and moves the step from `PENDING` to `DISPATCH_PREPARED` in one transaction. Only after that commit may an external side effect be attempted. Preparing the same step again returns the same UUID. Preparation does not consume an attempt; how attempts relate to dispatch and retry is not decided yet.
+
+The durable invariants:
+
+- A `PENDING` step never has a dispatch row through the normal APIs.
+- `prepare_step_dispatch` commits `DISPATCH_PREPARED` and the dispatch row atomically. A plain state transition cannot enter `DISPATCH_PREPARED`; it raises `DispatchPreparationRequired`.
+- A later state keeps the dispatch row, `CANCELLED` included. The row is historical evidence that preparation occurred, and it is not deleted because the step's current state changes.
+- A step already stored as `DISPATCH_PREPARED` by an earlier schema version may have no dispatch. It is migrated as it was and is not repaired; no identity is made up for it.
+
+Migrated in-flight step states that predate durable dispatch IDs are preserved, but ordinary progression is blocked until a later reconciliation mechanism resolves the missing dispatch identity.
+
+`DISPATCH_PREPARED` means only that this identity was reserved. It does not mean the request was sent, received or accepted, and it does not make a blind resend after a crash safe: a crash can happen after the external send but before local state advances, and recovery has to reconcile that.
+
+The future ROS adapter is expected to convert the durable `dispatch_id` into the explicit `goal_uuid` argument of `rclpy`'s `ActionClient.send_goal_async`. A stable goal UUID helps correlate the same external request. It does not guarantee exactly-once execution if the action server restarts or forgets the goal, so recovery stays conservative.
 
 The concepts below are the longer-term minimum. Only the parts listed above are implemented.
 
@@ -687,6 +705,7 @@ Phase 1 (section 16) is the current milestone. It proceeds in bounded tasks:
 - Task 002, durable mission identity and attempt accounting: **COMPLETE**. A ROS-independent Python core with SQLite storage.
 - Task 003, mission and step state model: **COMPLETE**. Pure state semantics and transition rules.
 - Task 004, persistent mission and step state: **COMPLETE**. Mission and step states stored in SQLite (schema version 2), with migration from version 1.
+- Task 005, durable dispatch identity and atomic dispatch preparation: **COMPLETE**. A step gets a durable dispatch UUID in the same transaction that marks it `DISPATCH_PREPARED` (schema version 3).
 
 ### M0: Hardware-Free Nav2 Baseline — COMPLETE
 

@@ -19,6 +19,7 @@ import hashlib
 import json
 import math
 from typing import Any
+import uuid
 
 from .errors import InvalidRequest
 from .state_machine import MissionState, StepState
@@ -122,6 +123,16 @@ class StepRecord:
     state: StepState
     created_at: datetime
     updated_at: datetime
+
+
+@dataclass(frozen=True)
+class DispatchRecord:
+    """The durable identity of a step's external dispatch."""
+
+    dispatch_id: uuid.UUID
+    mission_id: str
+    step_key: str
+    created_at: datetime
 
 
 def validate_step_keys(step_keys: Iterable[str]) -> tuple[str, ...]:

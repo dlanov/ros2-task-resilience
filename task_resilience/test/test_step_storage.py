@@ -104,8 +104,8 @@ def test_identical_replay_returns_the_existing_rows(store, mission):
 
 def test_replay_does_not_reset_state_or_rewrite_timestamps(store, mission):
     store.initialize_steps(mission.mission_id, KEYS)
-    moved = store.transition_step_state(
-        mission.mission_id, 'checkpoint_a', StepState.DISPATCH_PREPARED)
+    store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+    moved = store.get_step(mission.mission_id, 'checkpoint_a')
     before = store.get_steps(mission.mission_id)
 
     replay = store.initialize_steps(mission.mission_id, KEYS)
@@ -222,7 +222,7 @@ def test_the_same_step_keys_can_be_used_by_different_missions(store):
     store.initialize_steps(first.mission_id, KEYS)
     store.initialize_steps(second.mission_id, KEYS)
 
-    store.transition_step_state(first.mission_id, 'checkpoint_a', StepState.DISPATCH_PREPARED)
+    store.prepare_step_dispatch(first.mission_id, 'checkpoint_a')
 
     assert store.get_step(first.mission_id, 'checkpoint_a').state is StepState.DISPATCH_PREPARED
     assert store.get_step(second.mission_id, 'checkpoint_a').state is StepState.PENDING
