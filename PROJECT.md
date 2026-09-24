@@ -3,8 +3,8 @@
 > **Working title:** ROS 2 Task Resilience
 > **Working repository name:** `ros2-task-resilience`
 > **Initial ROS packages:** `task_resilience_msgs`, `task_resilience`, `task_resilience_demos`
-> **Status:** Pre-implementation / MVP design
-> **Last updated:** 2026-09-23
+> **Status:** Phase 1 (durable mission core) in progress. The ROS-independent core through Task 005 is committed; the Task 006 ROS action recovery spike is complete.
+> **Last updated:** 2026-09-24
 > **Primary maintainer:** Dennis Lanov
 
 ## 1. Project purpose
@@ -412,7 +412,7 @@ Migrated in-flight step states that predate durable dispatch IDs are preserved, 
 
 `DISPATCH_PREPARED` means only that this identity was reserved. It does not mean the request was sent, received or accepted, and it does not make a blind resend after a crash safe: a crash can happen after the external send but before local state advances, and recovery has to reconcile that.
 
-The future ROS adapter is expected to convert the durable `dispatch_id` into the explicit `goal_uuid` argument of `rclpy`'s `ActionClient.send_goal_async`. A stable goal UUID helps correlate the same external request. It does not guarantee exactly-once execution if the action server restarts or forgets the goal, so recovery stays conservative.
+The future ROS adapter is expected to convert the durable `dispatch_id` into the explicit `goal_uuid` argument of `rclpy`'s `ActionClient.send_goal_async`. A stable goal UUID helps correlate the same external request. It does not guarantee exactly-once execution if the action server restarts or forgets the goal, so recovery stays conservative. The Task 006 spike reported measurements of this on stock Nav2 under the tested conditions: see `docs/ros_action_recovery_spike.md`.
 
 The concepts below are the longer-term minimum. Only the parts listed above are implemented.
 
@@ -685,7 +685,7 @@ general robot autonomy framework
 
 These should be resolved by implementation evidence rather than speculation:
 
-1. Exact mission/action schema. (The persisted mission/step schema is implemented as version 2; the ROS action schema is still open.)
+1. Exact mission/action schema. (The persisted mission/step schema is implemented as version 3; the ROS action schema is still open.)
 2. Exact transaction boundaries around Nav2 dispatch.
 3. How much downstream ROS action state can be reconciled after different crash timings.
 4. Whether to expose attempt budgets in the public action interface in v0.1.
@@ -706,6 +706,7 @@ Phase 1 (section 16) is the current milestone. It proceeds in bounded tasks:
 - Task 003, mission and step state model: **COMPLETE**. Pure state semantics and transition rules.
 - Task 004, persistent mission and step state: **COMPLETE**. Mission and step states stored in SQLite (schema version 2), with migration from version 1.
 - Task 005, durable dispatch identity and atomic dispatch preparation: **COMPLETE**. A step gets a durable dispatch UUID in the same transaction that marks it `DISPATCH_PREPARED` (schema version 3).
+- Task 006, ROS action recovery spike: **COMPLETE**. A research spike, not production code. It reported what a fresh process can learn about a Nav2 `NavigateToPose` goal from its UUID alone (`docs/ros_action_recovery_spike.md`, scripts in `task_resilience_demos/scripts/`). Findings, limited to the inspected `rclpy` 7.1.11 and the tested Nav2 1.3.13 loopback setup on one host: the public `rclpy` API has no way to turn a UUID into a goal handle or fetch a result by UUID; the `/navigate_to_pose/_action/get_result` protocol service answered by UUID for as long as the server retained the goal (900 s in the stock `nav2_params.yaml`; a finished goal's result was reported retrievable at 882.5 s and gone at 902.2 s); in the two tested restarts (one clean, one SIGKILL) the restarted server returned `UNKNOWN` for goals that had been retained or active before the restart and accepted the same UUID again; and resubmitting a UUID the server still tracked aborted the Nav2 container in 7 of 7 planned trials (as reported). A pending or timed-out request is not evidence about the goal. `task_resilience` was not changed.
 
 ### M0: Hardware-Free Nav2 Baseline — COMPLETE
 
