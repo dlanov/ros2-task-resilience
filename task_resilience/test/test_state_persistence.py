@@ -30,6 +30,7 @@ from task_resilience.errors import (
     InvalidStateTransition,
     MissionCompletionInvariantError,
     MissionNotFound,
+    SendAuthorizationRequired,
     StepNotFound,
 )
 from task_resilience.state_machine import MissionState, StepState
@@ -82,8 +83,12 @@ def running(store, mission):
 def drive(store, mission_id, key, state):
     for step in ROUTE_TO[state]:
         if step is S.DISPATCH_PREPARED:
-            # The one state a plain transition cannot enter.
+            # A plain transition cannot enter this state...
             store.prepare_step_dispatch(mission_id, key)
+        elif step is S.DISPATCHED:
+            # ...nor this one. It takes authorizing the send, which needs a RUNNING mission
+            # and an attempt.
+            store.authorize_step_send(mission_id, key)
         else:
             store.transition_step_state(mission_id, key, step)
 
@@ -179,28 +184,28 @@ def test_unknown_mission_cannot_change_state(store):
 
 # Steps
 
-def test_step_state_change_is_persisted_and_stamped(store, mission):
-    store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
-    before = store.get_step(mission.mission_id, 'checkpoint_a')
+def test_step_state_change_is_persisted_and_stamped(store, running):
+    drive(store, running.mission_id, 'checkpoint_a', S.DISPATCHED)
+    before = store.get_step(running.mission_id, 'checkpoint_a')
 
-    updated = store.transition_step_state(mission.mission_id, 'checkpoint_a', S.DISPATCHED)
+    updated = store.transition_step_state(running.mission_id, 'checkpoint_a', S.ACCEPTED)
 
-    assert updated.state is S.DISPATCHED
+    assert updated.state is S.ACCEPTED
     assert updated.updated_at > before.updated_at
     assert updated.created_at == before.created_at
     assert updated.step_index == before.step_index
-    assert store.get_step(mission.mission_id, 'checkpoint_a') == updated
-    assert store.get_step(mission.mission_id, 'return_to_base').state is S.PENDING
+    assert store.get_step(running.mission_id, 'checkpoint_a') == updated
+    assert store.get_step(running.mission_id, 'return_to_base').state is S.PENDING
 
 
-def test_step_same_state_is_a_no_op_that_keeps_updated_at(store, mission):
-    store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
-    moved = store.transition_step_state(mission.mission_id, 'checkpoint_a', S.DISPATCHED)
+def test_step_same_state_is_a_no_op_that_keeps_updated_at(store, running):
+    drive(store, running.mission_id, 'checkpoint_a', S.ACCEPTED)
+    moved = store.get_step(running.mission_id, 'checkpoint_a')
 
-    replay = store.transition_step_state(mission.mission_id, 'checkpoint_a', S.DISPATCHED)
+    replay = store.transition_step_state(running.mission_id, 'checkpoint_a', S.ACCEPTED)
 
     assert replay == moved
-    assert store.get_step(mission.mission_id, 'checkpoint_a') == moved
+    assert store.get_step(running.mission_id, 'checkpoint_a') == moved
 
 
 def test_illegal_step_transitions_are_rejected_and_write_nothing(store, mission):
@@ -216,10 +221,10 @@ def test_illegal_step_transitions_are_rejected_and_write_nothing(store, mission)
     assert store.get_steps(mission.mission_id) == before
 
 
-def test_a_step_can_record_an_observed_result_without_intermediate_states(store, mission):
-    drive(store, mission.mission_id, 'checkpoint_a', S.DISPATCHED)
+def test_a_step_can_record_an_observed_result_without_intermediate_states(store, running):
+    drive(store, running.mission_id, 'checkpoint_a', S.DISPATCHED)
 
-    done = store.transition_step_state(mission.mission_id, 'checkpoint_a', S.SUCCEEDED)
+    done = store.transition_step_state(running.mission_id, 'checkpoint_a', S.SUCCEEDED)
 
     assert done.state is S.SUCCEEDED
 
@@ -286,7 +291,6 @@ def test_mission_and_step_state_survive_reopening_the_store(db_path):
         store.initialize_steps(mission.mission_id, KEYS)
         store.transition_mission_state(mission.mission_id, M.RUNNING)
         drive(store, mission.mission_id, 'checkpoint_a', S.SUCCEEDED)
-        store.consume_attempt(mission.mission_id)
         before = (store.get_by_mission_id(mission.mission_id), store.get_steps(mission.mission_id))
 
     with MissionStore(db_path) as reopened:
@@ -349,13 +353,15 @@ def test_a_state_change_survives_a_process_that_exits_abruptly(db_path):
 
 def test_mission_cannot_complete_while_a_step_is_pending(store, running):
     drive(store, running.mission_id, 'checkpoint_a', S.SUCCEEDED)
+    # Authorizing the send updated the mission row, so compare with it as it is now.
+    before = store.get_by_mission_id(running.mission_id)
 
     with pytest.raises(MissionCompletionInvariantError) as excinfo:
         store.transition_mission_state(running.mission_id, M.COMPLETED)
 
     assert excinfo.value.current is M.RUNNING
     assert excinfo.value.step_states == (S.SUCCEEDED, S.PENDING)
-    assert store.get_by_mission_id(running.mission_id) == running
+    assert store.get_by_mission_id(running.mission_id) == before
 
 
 def test_mission_completes_once_every_step_has_succeeded_and_stays_completed(
@@ -396,9 +402,11 @@ def test_any_persisted_step_that_is_not_succeeded_blocks_completion(
 
 
 def test_cancelling_mission_can_complete_only_if_every_step_succeeded(store, running):
-    store.transition_mission_state(running.mission_id, M.CANCELLING)
+    # The steps get their sends while the mission is RUNNING: a CANCELLING mission
+    # authorizes none.
     drive(store, running.mission_id, 'checkpoint_a', S.SUCCEEDED)
     drive(store, running.mission_id, 'return_to_base', S.CANCEL_REQUESTED)
+    store.transition_mission_state(running.mission_id, M.CANCELLING)
     with pytest.raises(MissionCompletionInvariantError):
         store.transition_mission_state(running.mission_id, M.COMPLETED)
 
@@ -433,9 +441,11 @@ def test_no_ordinary_transition_leaves_an_unknown_step_outcome(store, running):
     for target in S:
         if target is S.OUTCOME_UNKNOWN:
             continue
-        # DISPATCH_PREPARED has its own refusal, ahead of the state machine.
-        refusal = (DispatchPreparationRequired if target is S.DISPATCH_PREPARED
-                   else InvalidStateTransition)
+        # DISPATCH_PREPARED and DISPATCHED have their own refusals, ahead of the state machine.
+        refusal = {
+            S.DISPATCH_PREPARED: DispatchPreparationRequired,
+            S.DISPATCHED: SendAuthorizationRequired,
+        }.get(target, InvalidStateTransition)
         with pytest.raises(refusal):
             store.transition_step_state(running.mission_id, 'checkpoint_a', target)
 
@@ -481,14 +491,25 @@ def test_an_unknown_stored_mission_state_is_an_error_not_a_guess(store, mission,
         store.transition_mission_state(mission.mission_id, M.RUNNING)
 
 
-def test_corruption_found_during_a_write_rolls_it_back(store, mission, db_path):
+def test_corruption_found_while_authorizing_a_send_leaves_nothing_behind(
+        store, running, db_path):
+    store.prepare_step_dispatch(running.mission_id, 'checkpoint_a')
+
     corrupt(db_path, "UPDATE missions SET mission_state = 'BOGUS'")
-
     with pytest.raises(CorruptStoredState):
-        store.consume_attempt(mission.mission_id)
+        store.authorize_step_send(running.mission_id, 'checkpoint_a')
+    corrupt(db_path, "UPDATE missions SET mission_state = 'RUNNING'")
 
-    corrupt(db_path, "UPDATE missions SET mission_state = 'ACCEPTED'")
-    assert store.get_by_mission_id(mission.mission_id).attempts_used == 0
+    # A different step is damaged: the check that no step is unknown has to read it.
+    corrupt(db_path, "UPDATE mission_steps SET step_state = 'BOGUS'"
+                     " WHERE step_key = 'return_to_base'")
+    with pytest.raises(CorruptStoredState):
+        store.authorize_step_send(running.mission_id, 'checkpoint_a')
+    corrupt(db_path, "UPDATE mission_steps SET step_state = 'PENDING'"
+                     " WHERE step_key = 'return_to_base'")
+
+    assert store.get_by_mission_id(running.mission_id).attempts_used == 0
+    assert store.get_step(running.mission_id, 'checkpoint_a').state is S.DISPATCH_PREPARED
 
 
 @pytest.mark.parametrize('bad', ['BOGUS', 'executing', 'RUNNING', ''])
@@ -514,26 +535,39 @@ def test_an_unknown_stored_step_state_is_an_error_not_a_guess(store, mission, db
 
 # Attempt accounting is independent
 
-def test_step_transitions_do_not_consume_attempts(store, running):
-    drive(store, running.mission_id, 'checkpoint_a', S.EXECUTING)
-
+def test_only_authorizing_a_send_consumes_an_attempt(store, running):
+    store.prepare_step_dispatch(running.mission_id, 'checkpoint_a')
     assert store.get_by_mission_id(running.mission_id).attempts_used == 0
 
+    store.authorize_step_send(running.mission_id, 'checkpoint_a')
+    for step in (S.ACCEPTED, S.EXECUTING, S.SUCCEEDED):
+        store.transition_step_state(running.mission_id, 'checkpoint_a', step)
 
-def test_consuming_attempts_does_not_change_state(store, running):
-    consumed = store.consume_attempt(running.mission_id)
-
-    assert consumed.state is M.RUNNING
-    assert consumed.attempts_used == 1
-    assert store.get_step(running.mission_id, 'checkpoint_a').state is S.PENDING
+    # Preparing took none, authorizing took one, and the later transitions took none.
+    assert store.get_by_mission_id(running.mission_id).attempts_used == 1
 
 
-def test_the_attempt_limit_still_holds_alongside_state(store, mission):
+def test_authorizing_a_send_does_not_change_the_mission_state(store, running):
+    store.prepare_step_dispatch(running.mission_id, 'checkpoint_a')
+
+    receipt = store.authorize_step_send(running.mission_id, 'checkpoint_a')
+
+    after = store.get_by_mission_id(running.mission_id)
+    assert receipt.attempt_number == 1
+    assert after.state is M.RUNNING
+    assert after.attempts_used == 1
+    assert store.get_step(running.mission_id, 'return_to_base').state is S.PENDING
+
+
+def test_the_attempt_limit_still_holds_alongside_state(store):
     one_shot = store.create_or_get('req-one', {}, 1)
-    store.consume_attempt(one_shot.mission_id)
+    store.initialize_steps(one_shot.mission_id, KEYS)
     store.transition_mission_state(one_shot.mission_id, M.RUNNING)
+    for key in KEYS:
+        store.prepare_step_dispatch(one_shot.mission_id, key)
+    store.authorize_step_send(one_shot.mission_id, KEYS[0])
 
     with pytest.raises(AttemptLimitReached):
-        store.consume_attempt(one_shot.mission_id)
+        store.authorize_step_send(one_shot.mission_id, KEYS[1])
 
     assert store.get_by_mission_id(one_shot.mission_id).state is M.RUNNING

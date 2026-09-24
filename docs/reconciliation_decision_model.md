@@ -186,22 +186,23 @@ property, not a field: it cannot be passed to the constructor, set on an instanc
 with `dataclasses.replace()`. This guards against accident. It is not a defence against a caller
 that patches the class.
 
-It is `False` because deciding that a resend is safe needs facts this model does not have: what
-an attempt is, who owns the external send, whether another supervisor could be acting, and the
-server's retention and restart state. Task 006 reported that resubmitting a UUID the server
+It is `False` because deciding that a resend is safe needs facts this model does not have: who
+owns the external send, whether another supervisor could be acting, and the server's retention
+and restart state. What an attempt is was settled separately, by Task 008. Task 006 reported that resubmitting a UUID the server
 still tracked aborted the whole Nav2 container in 7 of 7 planned trials, and that after the
 server had forgotten it the same UUID started a second execution. A newly generated UUID is a
 new request, not a retry, and does not resolve what happened to the old one.
 
-The property is not a stepping stone. If a later task ever adds a send-authorization path, it
-should be a separate, reviewed decision with its own inputs.
+The property is not a stepping stone. Task 008 added send authorization as a separate storage
+API, `MissionStore.authorize_step_send` (`docs/send_authorization_model.md`). It has its own
+inputs and gates, it is not reachable through a reconciliation decision, and `authorizes_send`
+stays `False`.
 
 ## Deferred boundaries
 
 Task 007 does **not** decide or implement:
 
-- the meaning of an attempt;
-- attempt consumption or refund;
+- any policy for refunding an attempt (Task 008 never refunds one automatically);
 - retry policy;
 - external-send ownership;
 - leases, fencing, or single-supervisor exclusion;
@@ -215,6 +216,10 @@ Task 007 does **not** decide or implement:
 - any mission transition out of `NEEDS_RECONCILIATION`;
 - automatic mission-state changes;
 - whether physical motion may resume.
+
+Task 008 has since settled the meaning of an attempt and how one is consumed, and added send
+authorization as a separate storage API. It adds no leases, fencing or single-supervisor
+exclusion.
 
 Also not done: mapping ROS messages onto observations (an adapter), persisting the expected
 action context, any notion of time, freshness or server epoch, and a policy for resolving an

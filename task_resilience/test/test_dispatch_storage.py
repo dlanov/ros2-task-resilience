@@ -55,9 +55,10 @@ ROUTE_AFTER_PREPARE = {
     S.OUTCOME_UNKNOWN: [S.OUTCOME_UNKNOWN],
 }
 
-# A way out of each in-flight state that the state machine allows.
+# A way out of each in-flight state that a plain transition allows. DISPATCHED is entered
+# only by authorize_step_send, so the plain way out of DISPATCH_PREPARED is cancellation.
 IN_FLIGHT_EXITS = [
-    (S.DISPATCH_PREPARED, S.DISPATCHED),
+    (S.DISPATCH_PREPARED, S.CANCELLED),
     (S.DISPATCHED, S.ACCEPTED),
     (S.ACCEPTED, S.EXECUTING),
     (S.EXECUTING, S.SUCCEEDED),
@@ -95,9 +96,25 @@ def mission(store):
     return created
 
 
+@pytest.fixture
+def running(store, mission):
+    """Move the same mission to RUNNING, the state in which a send can be authorized."""
+    return store.transition_mission_state(mission.mission_id, M.RUNNING)
+
+
 def raw(db_path, sql, *params):
     with contextlib.closing(sqlite3.connect(db_path, isolation_level=None)) as conn:
         return conn.execute(sql, params).fetchall()
+
+
+def advance(store, mission_id, key, state):
+    """Walk a prepared step to a state along ROUTE_AFTER_PREPARE."""
+    for step in ROUTE_AFTER_PREPARE.get(state, []):
+        if step is S.DISPATCHED:
+            # A plain transition cannot enter DISPATCHED; the mission must be RUNNING.
+            store.authorize_step_send(mission_id, key)
+        else:
+            store.transition_step_state(mission_id, key, step)
 
 
 def dispatch_count(db_path):
@@ -216,11 +233,10 @@ def test_the_identity_survives_reopening_the_store(db_path):
     assert dispatch_count(db_path) == 1
 
 
-def test_a_prepared_step_can_advance_and_keeps_its_identity(store, mission, db_path):
+def test_a_prepared_step_can_advance_and_keeps_its_identity(store, mission, running, db_path):
     prepared = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
 
-    for state in ROUTE_AFTER_PREPARE[S.SUCCEEDED]:
-        store.transition_step_state(mission.mission_id, 'checkpoint_a', state)
+    advance(store, mission.mission_id, 'checkpoint_a', S.SUCCEEDED)
 
     assert store.get_step_dispatch(mission.mission_id, 'checkpoint_a') == prepared
     assert dispatch_count(db_path) == 1
@@ -229,10 +245,10 @@ def test_a_prepared_step_can_advance_and_keeps_its_identity(store, mission, db_p
 # Steps that cannot be prepared
 
 @pytest.mark.parametrize('state', list(ROUTE_AFTER_PREPARE))
-def test_a_step_past_preparation_cannot_be_prepared_again(store, mission, db_path, state):
+def test_a_step_past_preparation_cannot_be_prepared_again(
+        store, mission, running, db_path, state):
     prepared = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
-    for step in ROUTE_AFTER_PREPARE[state]:
-        store.transition_step_state(mission.mission_id, 'checkpoint_a', step)
+    advance(store, mission.mission_id, 'checkpoint_a', state)
 
     with pytest.raises(InvalidStateTransition) as excinfo:
         store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
@@ -319,11 +335,11 @@ def test_prepare_step_dispatch_is_the_supported_way_to_enter_dispatch_prepared(
 
 
 @pytest.mark.parametrize('state', [S.PENDING, S.DISPATCH_PREPARED, *ROUTE_AFTER_PREPARE])
-def test_the_refusal_does_not_depend_on_the_current_state(store, mission, db_path, state):
+def test_the_refusal_does_not_depend_on_the_current_state(
+        store, mission, running, db_path, state):
     if state is not S.PENDING:
         store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
-        for step in ROUTE_AFTER_PREPARE.get(state, []):
-            store.transition_step_state(mission.mission_id, 'checkpoint_a', step)
+        advance(store, mission.mission_id, 'checkpoint_a', state)
     step_before = store.get_step(mission.mission_id, 'checkpoint_a')
     dispatches_before = raw(db_path, 'SELECT * FROM step_dispatches')
 
@@ -351,12 +367,13 @@ def test_the_refusal_is_raised_before_the_database_is_touched(db_path):
     assert excinfo.value.step_key == 'no-such-step'
 
 
-def test_other_targets_still_use_the_plain_transition(store, mission):
+def test_other_targets_still_use_the_plain_transition(store, mission, running):
     store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+    store.authorize_step_send(mission.mission_id, 'checkpoint_a')
 
-    moved = store.transition_step_state(mission.mission_id, 'checkpoint_a', S.DISPATCHED)
+    moved = store.transition_step_state(mission.mission_id, 'checkpoint_a', S.ACCEPTED)
 
-    assert moved.state is S.DISPATCHED
+    assert moved.state is S.ACCEPTED
 
 
 def test_preparation_still_asks_the_state_machine_to_validate_the_move(
@@ -395,7 +412,10 @@ def test_a_state_machine_refusal_stops_preparation_and_writes_nothing(
 @pytest.mark.parametrize(('state', 'exit_to'), IN_FLIGHT_EXITS)
 def test_a_step_in_flight_without_a_dispatch_cannot_progress(
         store, mission, db_path, state, exit_to):
-    store.consume_attempt(mission.mission_id)
+    # A counter value seeded directly: this test is about the dispatch check, not about
+    # how the attempt was consumed.
+    raw(db_path, 'UPDATE missions SET attempts_used = 1 WHERE mission_id = ?',
+        mission.mission_id)
     leave_without_dispatch(db_path, mission, 'checkpoint_a', state)
     mission_before = store.get_by_mission_id(mission.mission_id)
     steps_before = store.get_steps(mission.mission_id)
@@ -420,8 +440,8 @@ def test_every_target_is_refused_for_a_step_in_flight_without_a_dispatch(
     steps_before = store.get_steps(mission.mission_id)
 
     for target in S:
-        if target is S.DISPATCH_PREPARED:
-            continue  # refused for every step, ahead of this check
+        if target in (S.DISPATCH_PREPARED, S.DISPATCHED):
+            continue  # each is refused for every step, ahead of this check
         # Legal, illegal and same-state alike: the dispatch check comes first.
         with pytest.raises(CorruptDispatchRecord):
             store.transition_step_state(mission.mission_id, 'checkpoint_a', target)
@@ -462,10 +482,9 @@ def test_finished_and_unknown_steps_need_no_dispatch(store, mission, db_path, st
 
 @pytest.mark.parametrize(('state', 'exit_to'), IN_FLIGHT_EXITS)
 def test_the_same_transitions_work_when_the_step_was_prepared_through_the_store(
-        store, mission, db_path, state, exit_to):
+        store, mission, running, db_path, state, exit_to):
     prepared = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
-    for step in ROUTE_AFTER_PREPARE.get(state, []):
-        store.transition_step_state(mission.mission_id, 'checkpoint_a', step)
+    advance(store, mission.mission_id, 'checkpoint_a', state)
     assert store.get_step(mission.mission_id, 'checkpoint_a').state is state
 
     moved = store.transition_step_state(mission.mission_id, 'checkpoint_a', exit_to)
@@ -481,13 +500,14 @@ def test_an_in_flight_step_with_an_unreadable_dispatch_id_cannot_progress(
     raw(db_path, "UPDATE step_dispatches SET dispatch_id = 'not-a-uuid'")
 
     with pytest.raises(CorruptDispatchRecord) as excinfo:
-        store.transition_step_state(mission.mission_id, 'checkpoint_a', S.DISPATCHED)
+        store.transition_step_state(mission.mission_id, 'checkpoint_a', S.CANCELLED)
 
     assert excinfo.value.value == 'not-a-uuid'
     assert store.get_step(mission.mission_id, 'checkpoint_a').state is S.DISPATCH_PREPARED
 
 
-# Not bound to mission state or to attempts yet
+# Preparation is not bound to mission state or to attempts. Authorizing a send is: see
+# test_send_authorization.py.
 
 @pytest.mark.parametrize('mission_state', list(MISSION_ROUTE))
 def test_preparation_is_not_gated_on_the_mission_state(store, mission_state):
@@ -504,8 +524,10 @@ def test_preparation_is_not_gated_on_the_mission_state(store, mission_state):
     assert before.state is mission_state
 
 
-def test_preparation_does_not_consume_attempts(store, mission):
-    store.consume_attempt(mission.mission_id)
+def test_preparation_does_not_consume_attempts(store, mission, db_path):
+    # A counter value seeded directly, as a mission with one attempt already used would have.
+    raw(db_path, 'UPDATE missions SET attempts_used = 1 WHERE mission_id = ?',
+        mission.mission_id)
     before = store.get_by_mission_id(mission.mission_id)
 
     store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
@@ -514,7 +536,9 @@ def test_preparation_does_not_consume_attempts(store, mission):
 
     assert store.get_by_mission_id(mission.mission_id) == before
     assert before.attempts_used == 1
-    assert store.consume_attempt(mission.mission_id).attempts_used == 2
+    # Only authorizing the send takes the next attempt.
+    store.transition_mission_state(mission.mission_id, M.RUNNING)
+    assert store.authorize_step_send(mission.mission_id, 'checkpoint_a').attempt_number == 2
 
 
 # Lookups

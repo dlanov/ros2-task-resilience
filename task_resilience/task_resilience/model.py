@@ -14,7 +14,7 @@
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field, InitVar
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 import json
 import math
@@ -133,6 +133,46 @@ class DispatchRecord:
     mission_id: str
     step_key: str
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class SendAuthorization:
+    """
+    The receipt of a send authorization that has been committed.
+
+    Returned once, to the one caller whose authorization committed. It is not stored, and
+    no API accepts it: holding one, or building one, gives no permission. It tells that
+    caller which dispatch_id to use and which attempt this was. The external request may
+    or may not be sent afterwards, and nothing here says it was.
+    """
+
+    mission_id: str
+    step_key: str
+    dispatch_id: uuid.UUID
+    # The mission's attempts_used after this authorization, so counted from 1.
+    attempt_number: int
+    max_attempts: int
+    authorized_at: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.mission_id, str) or not isinstance(self.step_key, str):
+            raise TypeError('mission_id and step_key must be strings')
+        if not self.mission_id or not self.step_key:
+            raise ValueError('mission_id and step_key must not be empty')
+        if not isinstance(self.dispatch_id, uuid.UUID):
+            raise TypeError(f'dispatch_id must be a uuid.UUID, got {self.dispatch_id!r}')
+        for name in ('attempt_number', 'max_attempts'):
+            value = getattr(self, name)
+            # bool is an int subclass, but True is not a count.
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f'{name} must be an int, got {value!r}')
+        if not 1 <= self.attempt_number <= self.max_attempts:
+            raise ValueError(
+                f'attempt_number {self.attempt_number} is not within 1..{self.max_attempts}')
+        if not isinstance(self.authorized_at, datetime):
+            raise TypeError(f'authorized_at must be a datetime, got {self.authorized_at!r}')
+        if self.authorized_at.utcoffset() != timedelta(0):
+            raise ValueError('authorized_at must be a timezone-aware UTC datetime')
 
 
 def validate_step_keys(step_keys: Iterable[str]) -> tuple[str, ...]:

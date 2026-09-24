@@ -27,12 +27,25 @@ from task_resilience.errors import (
     IdempotencyConflict,
     UnsupportedSchemaVersion,
 )
+from task_resilience.state_machine import MissionState
 from task_resilience.storage import MissionStore
+
+KEYS = ['checkpoint_a', 'return_to_base', 'final_check']
 
 
 @pytest.fixture
 def db_path(tmp_path):
     return tmp_path / 'missions.db'
+
+
+def running_mission(store, request_id, max_attempts, keys=KEYS[:2]):
+    """Create a RUNNING mission whose steps are all prepared, and return its ID."""
+    mission = store.create_or_get(request_id, {'x': 1}, max_attempts)
+    store.initialize_steps(mission.mission_id, keys)
+    store.transition_mission_state(mission.mission_id, MissionState.RUNNING)
+    for key in keys:
+        store.prepare_step_dispatch(mission.mission_id, key)
+    return mission.mission_id
 
 
 def pragma(db_path, name):
@@ -42,11 +55,12 @@ def pragma(db_path, name):
 
 def test_attempts_persist_after_reopening_the_store(db_path):
     with MissionStore(db_path) as store:
-        mission = store.create_or_get('req-001', {'x': 1}, 3)
-        consumed = store.consume_attempt(mission.mission_id)
+        mission_id = running_mission(store, 'req-001', 3)
+        store.authorize_step_send(mission_id, 'checkpoint_a')
+        consumed = store.get_by_mission_id(mission_id)
 
     with MissionStore(db_path) as reopened:
-        record = reopened.get_by_mission_id(mission.mission_id)
+        record = reopened.get_by_mission_id(mission_id)
 
     assert record.attempts_used == 1
     assert record == consumed
@@ -54,18 +68,18 @@ def test_attempts_persist_after_reopening_the_store(db_path):
 
 def test_reopening_does_not_replenish_attempts(db_path):
     with MissionStore(db_path) as store:
-        mission = store.create_or_get('req-001', {'x': 1}, 1)
-        store.consume_attempt(mission.mission_id)
+        mission_id = running_mission(store, 'req-001', 1)
+        store.authorize_step_send(mission_id, 'checkpoint_a')
 
     with MissionStore(db_path) as reopened:
         # A restarted client resubmits its request and gets the spent mission back.
         replay = reopened.create_or_get('req-001', {'x': 1}, 1)
-        assert replay.mission_id == mission.mission_id
+        assert replay.mission_id == mission_id
         assert replay.attempts_used == 1
 
         with pytest.raises(AttemptLimitReached):
-            reopened.consume_attempt(mission.mission_id)
-        assert reopened.get_by_mission_id(mission.mission_id).attempts_used == 1
+            reopened.authorize_step_send(mission_id, 'return_to_base')
+        assert reopened.get_by_mission_id(mission_id).attempts_used == 1
 
 
 def test_request_identity_persists_after_reopening_the_store(db_path):
@@ -81,11 +95,11 @@ def test_request_identity_persists_after_reopening_the_store(db_path):
 def test_committed_state_does_not_depend_on_closing_the_store(db_path):
     store = MissionStore(db_path)
     try:
-        mission = store.create_or_get('req-001', {'x': 1}, 3)
-        store.consume_attempt(mission.mission_id)
+        mission_id = running_mission(store, 'req-001', 3)
+        store.authorize_step_send(mission_id, 'checkpoint_a')
 
         with MissionStore(db_path) as other:
-            assert other.get_by_mission_id(mission.mission_id).attempts_used == 1
+            assert other.get_by_mission_id(mission_id).attempts_used == 1
     finally:
         store.close()
 
@@ -97,7 +111,7 @@ import sys
 from task_resilience.storage import MissionStore
 
 store = MissionStore(sys.argv[1])
-store.consume_attempt(sys.argv[2])
+store.authorize_step_send(sys.argv[2], 'checkpoint_a')
 # Die without closing the store or running any cleanup.
 os._exit(0)
 """
@@ -105,21 +119,21 @@ os._exit(0)
 
 def test_attempt_survives_a_process_that_exits_abruptly(db_path):
     with MissionStore(db_path) as store:
-        mission = store.create_or_get('req-001', {'x': 1}, 2)
+        mission_id = running_mission(store, 'req-001', 2, KEYS)
 
     package_root = Path(task_resilience.__file__).resolve().parent.parent
     subprocess.run(
-        [sys.executable, '-c', _CHILD, str(db_path), mission.mission_id],
+        [sys.executable, '-c', _CHILD, str(db_path), mission_id],
         env={**os.environ, 'PYTHONPATH': str(package_root)},
         check=True,
         timeout=30,
     )
 
     with MissionStore(db_path) as reopened:
-        assert reopened.get_by_mission_id(mission.mission_id).attempts_used == 1
-        assert reopened.consume_attempt(mission.mission_id).attempts_used == 2
+        assert reopened.get_by_mission_id(mission_id).attempts_used == 1
+        assert reopened.authorize_step_send(mission_id, 'return_to_base').attempt_number == 2
         with pytest.raises(AttemptLimitReached):
-            reopened.consume_attempt(mission.mission_id)
+            reopened.authorize_step_send(mission_id, 'final_check')
 
 
 def test_schema_version_is_recorded(db_path):

@@ -152,3 +152,45 @@ class DispatchPreparationRequired(Exception):
             'prepare_step_dispatch, not a plain state transition')
         self.mission_id = mission_id
         self.step_key = step_key
+
+
+class SendAuthorizationRequired(Exception):
+    """A step can enter DISPATCHED only through authorize_step_send."""
+
+    def __init__(self, mission_id: str, step_key: str) -> None:
+        super().__init__(
+            f'step {step_key!r} of mission {mission_id!r} must be authorized with '
+            'authorize_step_send, not a plain state transition')
+        self.mission_id = mission_id
+        self.step_key = step_key
+
+
+class MissionNotRunning(Exception):
+    """A send can be authorized only while the mission is RUNNING."""
+
+    def __init__(self, mission_id: str, mission_state: enum.Enum) -> None:
+        super().__init__(f'mission {mission_id!r} is {mission_state.value}, not RUNNING')
+        self.mission_id = mission_id
+        self.mission_state = mission_state
+
+
+class MissionReconciliationRequired(Exception):
+    """A step of the mission has an unknown outcome, so no new send is authorized."""
+
+    def __init__(self, mission_id: str, step_keys: tuple[str, ...]) -> None:
+        super().__init__(
+            f'mission {mission_id!r} has steps with an unknown outcome: {list(step_keys)}')
+        self.mission_id = mission_id
+        self.step_keys = step_keys
+
+
+class StepNotAwaitingSend(Exception):
+    """Only a step that is DISPATCH_PREPARED can be authorized to send."""
+
+    def __init__(self, mission_id: str, step_key: str, step_state: enum.Enum) -> None:
+        super().__init__(
+            f'step {step_key!r} of mission {mission_id!r} is {step_state.value}, '
+            'not DISPATCH_PREPARED')
+        self.mission_id = mission_id
+        self.step_key = step_key
+        self.step_state = step_state

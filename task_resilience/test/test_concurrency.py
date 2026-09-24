@@ -66,21 +66,36 @@ def run_concurrently(db_path, workers, rounds, operation):
         return [future.result(timeout=TIMEOUT) for future in futures]
 
 
-def consumed(store, mission_id):
+def running_missions(db_path, count, max_attempts, keys):
+    """Create RUNNING missions whose steps are all prepared, and return their IDs."""
+    mission_ids = []
+    with MissionStore(db_path) as store:
+        for n in range(count):
+            mission = store.create_or_get(f'req-{n}', {'n': n}, max_attempts)
+            store.initialize_steps(mission.mission_id, keys)
+            store.transition_mission_state(mission.mission_id, MissionState.RUNNING)
+            for key in keys:
+                store.prepare_step_dispatch(mission.mission_id, key)
+            mission_ids.append(mission.mission_id)
+    return mission_ids
+
+
+def authorized(store, mission_id, step_key):
     try:
-        store.consume_attempt(mission_id)
+        store.authorize_step_send(mission_id, step_key)
     except AttemptLimitReached:
         return False
     return True
 
 
-def test_two_consumers_cannot_both_take_the_final_attempt(db_path):
-    with MissionStore(db_path) as store:
-        mission_ids = [
-            store.create_or_get(f'req-{n}', {'n': n}, 1).mission_id for n in range(ROUNDS)]
+def test_two_callers_cannot_both_take_the_final_attempt(db_path):
+    # Two different steps of one mission compete for the mission-wide budget.
+    keys = ['checkpoint_a', 'return_to_base']
+    mission_ids = running_missions(db_path, ROUNDS, 1, keys)
 
     results = run_concurrently(
-        db_path, 2, ROUNDS, lambda store, worker, n: consumed(store, mission_ids[n]))
+        db_path, 2, ROUNDS,
+        lambda store, worker, n: authorized(store, mission_ids[n], keys[worker]))
 
     with MissionStore(db_path) as store:
         for n, mission_id in enumerate(mission_ids):
@@ -90,21 +105,24 @@ def test_two_consumers_cannot_both_take_the_final_attempt(db_path):
             assert store.get_by_mission_id(mission_id).attempts_used == 1
 
 
-def test_many_consumers_never_exceed_the_limit(db_path):
-    workers, max_attempts, rounds = 8, 3, 10
-    with MissionStore(db_path) as store:
-        mission_ids = [
-            store.create_or_get(f'req-{n}', {'n': n}, max_attempts).mission_id
-            for n in range(rounds)]
+def test_many_callers_never_exceed_the_limit(db_path):
+    workers, max_attempts, rounds = 6, 3, 10
+    keys = [f'step_{n}' for n in range(workers)]
+    mission_ids = running_missions(db_path, rounds, max_attempts, keys)
 
     results = run_concurrently(
-        db_path, workers, rounds, lambda store, worker, n: consumed(store, mission_ids[n]))
+        db_path, workers, rounds,
+        lambda store, worker, n: authorized(store, mission_ids[n], keys[worker]))
 
     with MissionStore(db_path) as store:
         for n, mission_id in enumerate(mission_ids):
             outcomes = [worker[n] for worker in results]
             assert outcomes.count(True) == max_attempts, f'round {n}: {outcomes}'
             assert store.get_by_mission_id(mission_id).attempts_used == max_attempts
+            # Each attempt that was consumed moved exactly one step.
+            dispatched = [step for step in store.get_steps(mission_id)
+                          if step.state is StepState.DISPATCHED]
+            assert len(dispatched) == max_attempts
 
 
 def test_concurrent_replays_of_one_request_create_one_mission(db_path):
@@ -171,32 +189,38 @@ def test_concurrent_first_open_creates_the_schema_once(tmp_path):
 def test_lock_timeout_surfaces_and_consumes_nothing(db_path):
     with MissionStore(db_path, busy_timeout=0.05) as store:
         mission = store.create_or_get('req-001', {'x': 1}, 1)
+        store.initialize_steps(mission.mission_id, ['checkpoint'])
+        store.transition_mission_state(mission.mission_id, MissionState.RUNNING)
+        store.prepare_step_dispatch(mission.mission_id, 'checkpoint')
 
         blocker = sqlite3.connect(db_path, isolation_level=None)
         blocker.execute('BEGIN IMMEDIATE')
         try:
             with pytest.raises(sqlite3.OperationalError):
-                store.consume_attempt(mission.mission_id)
+                store.authorize_step_send(mission.mission_id, 'checkpoint')
         finally:
             blocker.execute('ROLLBACK')
             blocker.close()
 
-        # The failed attempt must not have counted, and the store must still work.
+        # The failed authorization must not have counted, and the store must still work.
         assert store.get_by_mission_id(mission.mission_id).attempts_used == 0
-        assert store.consume_attempt(mission.mission_id).attempts_used == 1
+        assert store.get_step(mission.mission_id, 'checkpoint').state is (
+            StepState.DISPATCH_PREPARED)
+        assert store.authorize_step_send(mission.mission_id, 'checkpoint').attempt_number == 1
 
 
-def missions_with_an_executing_step(db_path, count, running=False):
+def missions_with_an_executing_step(db_path, count):
     mission_ids = []
     with MissionStore(db_path) as store:
         for n in range(count):
             mission = store.create_or_get(f'req-{n}', {'n': n}, 3)
             store.initialize_steps(mission.mission_id, ['checkpoint'])
+            store.transition_mission_state(mission.mission_id, MissionState.RUNNING)
             store.prepare_step_dispatch(mission.mission_id, 'checkpoint')
-            for state in (StepState.DISPATCHED, StepState.ACCEPTED, StepState.EXECUTING):
+            # DISPATCHED is entered only by authorizing the send.
+            store.authorize_step_send(mission.mission_id, 'checkpoint')
+            for state in (StepState.ACCEPTED, StepState.EXECUTING):
                 store.transition_step_state(mission.mission_id, 'checkpoint', state)
-            if running:
-                store.transition_mission_state(mission.mission_id, MissionState.RUNNING)
             mission_ids.append(mission.mission_id)
     return mission_ids
 
@@ -250,7 +274,7 @@ def test_concurrent_identical_step_results_all_succeed(db_path):
 
 
 def test_completion_never_overtakes_an_unfinished_step(db_path):
-    mission_ids = missions_with_an_executing_step(db_path, ROUNDS, running=True)
+    mission_ids = missions_with_an_executing_step(db_path, ROUNDS)
 
     def act(store, worker, n):
         if worker == 0:

@@ -3,7 +3,7 @@
 > **Working title:** ROS 2 Task Resilience
 > **Working repository name:** `ros2-task-resilience`
 > **Initial ROS packages:** `task_resilience_msgs`, `task_resilience`, `task_resilience_demos`
-> **Status:** Phase 1 (durable mission core) in progress. The ROS-independent core through Task 005 is committed; the Task 006 ROS action recovery spike is complete.
+> **Status:** Phase 1 (durable mission core) in progress. The ROS-independent core, the Task 006 recovery spike and the Task 007 reconciliation decision model are committed; Task 008 (send authorization and attempt semantics) is complete.
 > **Last updated:** 2026-09-24
 > **Primary maintainer:** Dennis Lanov
 
@@ -399,7 +399,7 @@ Every state change is validated by the state model (section 13) inside a write t
 
 ### Dispatch identity
 
-Preparing a step for dispatch reserves a durable UUID and moves the step from `PENDING` to `DISPATCH_PREPARED` in one transaction. Only after that commit may an external side effect be attempted. Preparing the same step again returns the same UUID. Preparation does not consume an attempt; how attempts relate to dispatch and retry is not decided yet.
+Preparing a step for dispatch reserves a durable UUID and moves the step from `PENDING` to `DISPATCH_PREPARED` in one transaction. That commit only reserves the identity, and the UUID stays reserved whether or not anything is ever sent. `DISPATCH_PREPARED` does not authorize an external send: an external send may be attempted only by the caller that successfully returns from `authorize_step_send`, described under "Send authorization and attempts" below. Even a committed authorization (`DISPATCHED`) does not prove that a send actually happened. Preparing the same step again returns the same UUID. Preparation does not consume an attempt.
 
 The durable invariants:
 
@@ -413,6 +413,18 @@ Migrated in-flight step states that predate durable dispatch IDs are preserved, 
 `DISPATCH_PREPARED` means only that this identity was reserved. It does not mean the request was sent, received or accepted, and it does not make a blind resend after a crash safe: a crash can happen after the external send but before local state advances, and recovery has to reconcile that.
 
 The future ROS adapter is expected to convert the durable `dispatch_id` into the explicit `goal_uuid` argument of `rclpy`'s `ActionClient.send_goal_async`. A stable goal UUID helps correlate the same external request. It does not guarantee exactly-once execution if the action server restarts or forgets the goal, so recovery stays conservative. The Task 006 spike reported measurements of this on stock Nav2 under the tested conditions: see `docs/ros_action_recovery_spike.md`.
+
+### Send authorization and attempts
+
+**One attempt is one committed authorization to send one external step request.** The counter (`attempts_used` against `max_attempts`) is mission-wide, and preparation consumes none.
+
+`MissionStore.authorize_step_send(mission_id, step_key)` is the only operation that increases `attempts_used`, and the only one that enters `DISPATCHED`. In one write transaction it checks that the mission is `RUNNING`, that the step is exactly `DISPATCH_PREPARED`, that no step of the mission is `OUTCOME_UNKNOWN`, that the step's dispatch UUID exists and is valid, and that an attempt remains. It then takes one attempt and moves the step to `DISPATCHED`, with one UTC timestamp for both rows. It returns a `SendAuthorization` receipt only after the commit. Nothing external happens inside the transaction. The public `consume_attempt` was removed, and a plain state transition into `DISPATCHED` raises `SendAuthorizationRequired`. See `docs/send_authorization_model.md`.
+
+- `DISPATCHED` means a send authorization was durably committed. The external request may or may not have been sent or received. It does not mean sent, received, accepted or executing.
+- The guarantee is at most one successful authorization return per prepared dispatch. If the process dies after the commit and before its caller receives the receipt, no later caller gets another one. That can mean no send at all, and never a second authorization.
+- An attempt is never refunded automatically: not by a restart, a crash, a rejection, a timeout, an unavailable service, a transport error, a server `UNKNOWN`, or a later cancellation. No retry is authorized by this design.
+- Every new increment made by `authorize_step_send` is a committed send authorization. A nonzero `attempts_used` that predates Task 008, produced by the removed `consume_attempt`, is kept as spent budget. Its cause is not reconstructed, and it is never refunded.
+- Schema version 3 allows one dispatch identity per step, so budget beyond the number of steps cannot yet be used as retries. A future retry would consume another mission-wide unit and must use a new dispatch identity.
 
 The concepts below are the longer-term minimum. Only the parts listed above are implemented.
 
@@ -477,7 +489,7 @@ CANCELLED
 OUTCOME_UNKNOWN
 ```
 
-The distinction between a locally recorded dispatch intention and evidence that the downstream server accepted/executed it is important.
+The distinction between a locally recorded dispatch intention and evidence that the downstream server accepted/executed it is important. `DISPATCHED` is a committed send authorization, not evidence that anything was sent.
 
 State names may change after implementation review.
 
@@ -686,7 +698,7 @@ general robot autonomy framework
 These should be resolved by implementation evidence rather than speculation:
 
 1. Exact mission/action schema. (The persisted mission/step schema is implemented as version 3; the ROS action schema is still open.)
-2. Exact transaction boundaries around Nav2 dispatch.
+2. Exact transaction boundaries around Nav2 dispatch. (The boundary of the send authorization is settled by Task 008; the adapter's send and the recording of its result are not.)
 3. How much downstream ROS action state can be reconciled after different crash timings.
 4. Whether to expose attempt budgets in the public action interface in v0.1.
 5. Whether mission events should be append-only from the beginning.
@@ -707,6 +719,8 @@ Phase 1 (section 16) is the current milestone. It proceeds in bounded tasks:
 - Task 004, persistent mission and step state: **COMPLETE**. Mission and step states stored in SQLite (schema version 2), with migration from version 1.
 - Task 005, durable dispatch identity and atomic dispatch preparation: **COMPLETE**. A step gets a durable dispatch UUID in the same transaction that marks it `DISPATCH_PREPARED` (schema version 3).
 - Task 006, ROS action recovery spike: **COMPLETE**. A research spike, not production code. It reported what a fresh process can learn about a Nav2 `NavigateToPose` goal from its UUID alone (`docs/ros_action_recovery_spike.md`, scripts in `task_resilience_demos/scripts/`). Findings, limited to the inspected `rclpy` 7.1.11 and the tested Nav2 1.3.13 loopback setup on one host: the public `rclpy` API has no way to turn a UUID into a goal handle or fetch a result by UUID; the `/navigate_to_pose/_action/get_result` protocol service answered by UUID for as long as the server retained the goal (900 s in the stock `nav2_params.yaml`; a finished goal's result was reported retrievable at 882.5 s and gone at 902.2 s); in the two tested restarts (one clean, one SIGKILL) the restarted server returned `UNKNOWN` for goals that had been retained or active before the restart and accepted the same UUID again; and resubmitting a UUID the server still tracked aborted the Nav2 container in 7 of 7 planned trials (as reported). A pending or timed-out request is not evidence about the goal. `task_resilience` was not changed.
+- Task 007, reconciliation decision model: **COMPLETE**. A pure decision function (`task_resilience/reconciliation.py`) that says what one recovery observation can establish about a dispatch. It changes no state and never authorizes a send (`docs/reconciliation_decision_model.md`).
+- Task 008, atomic send authorization and attempt semantics: **COMPLETE**. One attempt is one committed authorization to send one external step request, and `MissionStore.authorize_step_send` is the only way to take one and the only way to enter `DISPATCHED`. No schema change (version 3). See `docs/send_authorization_model.md`.
 
 ### M0: Hardware-Free Nav2 Baseline — COMPLETE
 

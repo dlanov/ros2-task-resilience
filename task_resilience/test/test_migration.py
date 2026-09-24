@@ -200,12 +200,25 @@ def test_consumed_attempts_survive_migration(db_path):
     make_v1_database(db_path, LEGACY)
 
     with MissionStore(db_path) as store:
+        # The counts written before the migration are kept as they were.
         assert store.get_by_mission_id(LEGACY[0]['mission_id']).attempts_used == 2
-        assert store.consume_attempt(LEGACY[0]['mission_id']).attempts_used == 3
+        assert store.get_by_mission_id(LEGACY[2]['mission_id']).attempts_used == 1
+
+        for mission_id in (LEGACY[0]['mission_id'], LEGACY[2]['mission_id']):
+            store.initialize_steps(mission_id, ['checkpoint_a', 'return_to_base'])
+            store.transition_mission_state(mission_id, MissionState.RUNNING)
+            store.prepare_step_dispatch(mission_id, 'checkpoint_a')
+            store.prepare_step_dispatch(mission_id, 'return_to_base')
+
+        # A legacy mission continues from its count: 2 used of 3 leaves one send.
+        first = store.authorize_step_send(LEGACY[0]['mission_id'], 'checkpoint_a')
+        assert first.attempt_number == 3
         with pytest.raises(AttemptLimitReached):
-            store.consume_attempt(LEGACY[0]['mission_id'])
+            store.authorize_step_send(LEGACY[0]['mission_id'], 'return_to_base')
+        # A mission that was already spent stays spent.
         with pytest.raises(AttemptLimitReached):
-            store.consume_attempt(LEGACY[2]['mission_id'])
+            store.authorize_step_send(LEGACY[2]['mission_id'], 'checkpoint_a')
+        assert store.get_by_mission_id(LEGACY[2]['mission_id']).attempts_used == 1
 
 
 def test_requests_accepted_before_migration_still_match_on_replay(db_path):
@@ -226,7 +239,8 @@ def test_requests_accepted_before_migration_still_match_on_replay(db_path):
 
 def test_new_apis_work_on_a_migrated_mission(db_path):
     make_v1_database(db_path, LEGACY)
-    mission_id = LEGACY[0]['mission_id']
+    # LEGACY[1] has used none of its 5 attempts: enough for both sends.
+    mission_id = LEGACY[1]['mission_id']
 
     with MissionStore(db_path) as store:
         steps = store.initialize_steps(mission_id, ['checkpoint_a', 'return_to_base'])
@@ -239,8 +253,8 @@ def test_new_apis_work_on_a_migrated_mission(db_path):
 
         for key in ('checkpoint_a', 'return_to_base'):
             store.prepare_step_dispatch(mission_id, key)
-            for state in (StepState.DISPATCHED, StepState.SUCCEEDED):
-                store.transition_step_state(mission_id, key, state)
+            store.authorize_step_send(mission_id, key)
+            store.transition_step_state(mission_id, key, StepState.SUCCEEDED)
         completed = store.transition_mission_state(mission_id, MissionState.COMPLETED)
 
     assert completed.state is MissionState.COMPLETED
@@ -438,9 +452,10 @@ V2_STEPS = [
     (INFLIGHT_ID, 'cancelled', 5, 'CANCELLED'),
 ]
 
-# A way out of each migrated in-flight step that the state machine allows.
+# A way out of each migrated in-flight step that a plain transition allows. DISPATCHED is
+# entered only by authorize_step_send, so the plain way out of a prepared step is cancellation.
 INFLIGHT_EXITS = [
-    ('prepared', StepState.DISPATCHED),
+    ('prepared', StepState.CANCELLED),
     ('dispatched', StepState.ACCEPTED),
     ('accepted', StepState.EXECUTING),
     ('executing', StepState.SUCCEEDED),
@@ -606,8 +621,8 @@ def test_a_migrated_succeeded_step_without_a_dispatch_still_counts_toward_comple
 
         # The pending step is finished natively, with a dispatch of its own.
         store.prepare_step_dispatch(RUNNING_ID, 'return_to_base')
-        for state in (StepState.DISPATCHED, StepState.ACCEPTED, StepState.EXECUTING,
-                      StepState.SUCCEEDED):
+        store.authorize_step_send(RUNNING_ID, 'return_to_base')
+        for state in (StepState.ACCEPTED, StepState.EXECUTING, StepState.SUCCEEDED):
             store.transition_step_state(RUNNING_ID, 'return_to_base', state)
         completed = store.transition_mission_state(RUNNING_ID, MissionState.COMPLETED)
 
@@ -623,7 +638,9 @@ def test_a_native_step_in_a_migrated_mission_progresses_normally(db_path):
     with MissionStore(db_path) as store:
         # A step of a migrated mission that is still PENDING is fully native from here.
         prepared = store.prepare_step_dispatch(RUNNING_ID, 'return_to_base')
-        for state in (StepState.DISPATCHED, StepState.ACCEPTED, StepState.EXECUTING):
+        store.authorize_step_send(RUNNING_ID, 'return_to_base')
+        assert store.get_step(RUNNING_ID, 'return_to_base').state is StepState.DISPATCHED
+        for state in (StepState.ACCEPTED, StepState.EXECUTING):
             assert store.transition_step_state(RUNNING_ID, 'return_to_base', state).state is state
 
         assert store.get_step_dispatch(RUNNING_ID, 'return_to_base') == prepared
@@ -660,7 +677,9 @@ def test_existing_apis_keep_working_on_a_migrated_version_2_database(db_path):
     make_v2_database(db_path)
 
     with MissionStore(db_path) as store:
-        assert store.consume_attempt(RUNNING_ID).attempts_used == 2
+        # RUNNING_ID has used 1 of its 3 attempts; the next send is the second.
+        store.prepare_step_dispatch(RUNNING_ID, 'return_to_base')
+        assert store.authorize_step_send(RUNNING_ID, 'return_to_base').attempt_number == 2
         store.transition_step_state(RUNNING_ID, 'return_to_base', StepState.CANCELLED)
         with pytest.raises(MissionCompletionInvariantError):
             store.transition_mission_state(RUNNING_ID, MissionState.COMPLETED)

@@ -30,11 +30,22 @@ from .errors import (
     DispatchPreparationRequired,
     IdempotencyConflict,
     MissionNotFound,
+    MissionNotRunning,
+    MissionReconciliationRequired,
+    SendAuthorizationRequired,
     StepDefinitionConflict,
+    StepNotAwaitingSend,
     StepNotFound,
     UnsupportedSchemaVersion,
 )
-from .model import DispatchRecord, MissionRecord, MissionRequest, StepRecord, validate_step_keys
+from .model import (
+    DispatchRecord,
+    MissionRecord,
+    MissionRequest,
+    SendAuthorization,
+    StepRecord,
+    validate_step_keys,
+)
 from .state_machine import MissionState, StepState, transition_mission, transition_step
 
 SCHEMA_VERSION = 3
@@ -135,7 +146,8 @@ INSERT INTO missions (
 """
 
 # The limit is checked in the WHERE clause, so a mission that is already at
-# its limit matches no row and its counter and timestamp are left alone.
+# its limit matches no row and its counter and timestamp are left alone. Only
+# authorize_step_send runs this: an attempt is one committed send authorization.
 _CONSUME = """
 UPDATE missions
 SET attempts_used = attempts_used + 1, updated_at = ?
@@ -289,14 +301,6 @@ class MissionStore:
     def get_by_request_id(self, request_id: str) -> MissionRecord:
         return self._require(_BY_REQUEST_ID, request_id)
 
-    def consume_attempt(self, mission_id: str) -> MissionRecord:
-        with self._transaction():
-            updated = self._conn.execute(_CONSUME, (_utc_now(), mission_id)).rowcount
-            record = self._require(_BY_MISSION_ID, mission_id)
-            if not updated:
-                raise AttemptLimitReached(mission_id, record.max_attempts)
-            return record
-
     def initialize_steps(
         self, mission_id: str, step_keys: Iterable[str],
     ) -> tuple[StepRecord, ...]:
@@ -350,6 +354,11 @@ class MissionStore:
         # current state, so the mistake shows up whatever the timing.
         if target is StepState.DISPATCH_PREPARED:
             raise DispatchPreparationRequired(mission_id, step_key)
+        # DISPATCHED is where an attempt is consumed and the one send is authorized.
+        # Refused for every current state, a same-state replay included, and before any
+        # lookup, for the same reason.
+        if target is StepState.DISPATCHED:
+            raise SendAuthorizationRequired(mission_id, step_key)
         with self._transaction():
             step = self._require_step(mission_id, step_key)
             # An in-flight step migrated from version 2 has no dispatch identity,
@@ -385,13 +394,66 @@ class MissionStore:
                     mission_id, step_key, f'step is {step.state.value} but already has a dispatch',
                     str(existing.dispatch_id))
 
-            # The ID and the state change commit together. Once this commits an
-            # adapter may act on the ID; if it never does, nothing was reserved.
+            # The ID and DISPATCH_PREPARED commit together. That only reserves the
+            # identity, and it stays reserved whether or not anything is ever sent.
+            # It does not authorize an external send: authorize_step_send is the
+            # separate operation that does.
             dispatch_id = uuid.uuid4()
             now = _utc_now()
             self._conn.execute(_INSERT_DISPATCH, (str(dispatch_id), mission_id, step_key, now))
             self._conn.execute(_SET_STEP_STATE, (new_state.value, now, mission_id, step_key))
             return self._require_dispatch(mission_id, step_key)
+
+    def authorize_step_send(self, mission_id: str, step_key: str) -> SendAuthorization:
+        """
+        Authorize the one send of a prepared step, consuming one attempt for it.
+
+        The checks and both writes are a single transaction, and the receipt is returned
+        only once it has committed. Nothing external happens in here: the caller sends
+        afterwards, and only a caller that got a receipt may. A replay is refused and is
+        never answered with the earlier receipt. A committed authorization is not undone,
+        so a crash after the commit can mean no send at all, but never a second
+        authorization.
+        """
+        with self._transaction():
+            mission = self._require(_BY_MISSION_ID, mission_id)
+            if mission.state is not MissionState.RUNNING:
+                raise MissionNotRunning(mission_id, mission.state)
+
+            step = self._require_step(mission_id, step_key)
+            if step.state is not StepState.DISPATCH_PREPARED:
+                raise StepNotAwaitingSend(mission_id, step_key, step.state)
+
+            # A step that is already unknown comes first, even if the mission has not been
+            # moved to NEEDS_RECONCILIATION yet.
+            unknown = tuple(
+                other.step_key for other in self._fetch_steps(mission_id)
+                if other.state is StepState.OUTCOME_UNKNOWN)
+            if unknown:
+                raise MissionReconciliationRequired(mission_id, unknown)
+
+            dispatch = self._fetch_dispatch(mission_id, step_key)
+            if dispatch is None:
+                raise CorruptDispatchRecord(
+                    mission_id, step_key, f'step is {step.state.value} but has no dispatch')
+
+            # The state machine still decides that this edge exists.
+            new_state = transition_step(step.state, StepState.DISPATCHED)
+            now = _utc_now()
+            if not self._conn.execute(_CONSUME, (now, mission_id)).rowcount:
+                raise AttemptLimitReached(mission_id, mission.max_attempts)
+            self._conn.execute(_SET_STEP_STATE, (new_state.value, now, mission_id, step_key))
+
+            # Built here, but the caller gets it only when this block ends: if COMMIT
+            # fails, the caller gets that error and no receipt.
+            return SendAuthorization(
+                mission_id=mission_id,
+                step_key=step_key,
+                dispatch_id=dispatch.dispatch_id,
+                attempt_number=mission.attempts_used + 1,
+                max_attempts=mission.max_attempts,
+                authorized_at=datetime.fromisoformat(now),
+            )
 
     def get_step_dispatch(self, mission_id: str, step_key: str) -> DispatchRecord:
         self._require_step(mission_id, step_key)
