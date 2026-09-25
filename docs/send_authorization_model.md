@@ -6,7 +6,9 @@ lets a caller send a prepared step's request externally. Code:
 `SendAuthorization` receipt in `model.py`, and four errors in `errors.py`. Tests:
 `task_resilience/test/test_send_authorization.py`.
 
-It changes no schema. Schema version 3 is exactly as before, with no migration, column or table.
+Task 008 itself changed no schema: version 3 stayed as it was, with no migration, column or table.
+Task 009 later moved the schema to version 4 and added one precondition to this operation, the
+bound action context (see "The operation" and `docs/dispatch_context_model.md`).
 
 ## The attempt
 
@@ -33,12 +35,12 @@ include that inherited consumption: a mission that had used 2 attempts before th
 
 | State | Means |
 |---|---|
-| `DISPATCH_PREPARED` | A dispatch UUID was durably reserved. No send authorization has been committed. The supported execution path must not send yet. |
+| `DISPATCH_PREPARED` | A dispatch UUID was durably reserved, and since Task 009 the action context it is declared to reach is bound with it (a step prepared under version 3 has none, and none is added later; see `docs/dispatch_context_model.md`). No send authorization has been committed. The supported execution path must not send yet. |
 | `DISPATCHED` | A send authorization was **durably committed**. The external request may or may not actually have been sent or received. |
 
 This is a rule for the supported path, not something the state can prove. Nothing in the schema
 or the code stops a caller that sends without asking, or an older or bypassing writer (see
-"Schema version 3"), so `DISPATCH_PREPARED` does not by itself show that no request left the
+"Schema"), so `DISPATCH_PREPARED` does not by itself show that no request left the
 process.
 
 `DISPATCHED` does **not** mean sent, received, accepted or executing. Later states record what
@@ -72,10 +74,19 @@ the first that fails raises without having written anything:
 | 5 | the step is exactly `DISPATCH_PREPARED` | `StepNotAwaitingSend(mission_id, step_key, step_state)` |
 | 6 | no step of the mission is `OUTCOME_UNKNOWN` | `MissionReconciliationRequired(mission_id, step_keys)` |
 | 7 | the step has exactly one dispatch row with a canonical UUID | `CorruptDispatchRecord` |
-| 8 | the state machine still allows `DISPATCH_PREPARED` to `DISPATCHED` | `InvalidStateTransition` |
-| 9 | an attempt remains, and one is taken | `AttemptLimitReached` |
-| 10 | the step is moved to `DISPATCHED` | |
-| 11 | the receipt is returned, only after the transaction commits | |
+| 8 | the dispatch has a valid bound action context (added by Task 009) | `DispatchContextMissing`, `CorruptDispatchContext` |
+| 9 | the state machine still allows `DISPATCH_PREPARED` to `DISPATCHED` | `InvalidStateTransition` |
+| 10 | an attempt remains, and one is taken | `AttemptLimitReached` |
+| 11 | the step is moved to `DISPATCHED` | |
+| 12 | the receipt is returned, only after the transaction commits | |
+
+Check 8 is the only change Task 009 makes to this operation. It comes before anything is written,
+so a refusal takes no attempt and changes no cell. The order of every other check is as before,
+and an exhausted mission with no bound context is told about the context, not the budget.
+
+Nothing binds a context afterwards, so a prepared step that has none, whether it was prepared under
+version 3 or its context was removed outside the supported code, cannot be authorized. It fails
+closed with `DispatchContextMissing` and the store does not try to tell the two apart.
 
 The writes are exactly two updates, with one shared timestamp: on the mission row,
 `attempts_used` and `updated_at`; on the step row, `step_state` and `updated_at`. The dispatch
@@ -215,14 +226,16 @@ For `checkpoint_a` then `return_to_base`, a normal run takes **two** attempts.
 |---|---|
 | 1 | Only one of the two normal sends can be authorized. The mission cannot complete normally. |
 | 2 | Exactly enough budget for the two normal sends. |
-| more than 2 | Extra budget exists for future additional authorized sends. Schema version 3 permits one dispatch identity per step, so those units cannot yet be used as retries. |
+| more than 2 | Extra budget exists for future additional authorized sends. The schema permits one dispatch identity per step, so those units cannot yet be used as retries. |
 
 Nothing validates that `max_attempts` is at least the number of steps. That would change what a
 request means and its fingerprint, and it is outside this task.
 
-## Schema version 3
+## Schema
 
-Nothing new is stored. What the design rests on:
+Task 008 stored nothing new, and version 3 was unchanged by it. Task 009 has since moved the schema
+to version 4 with one table for the dispatch's action context (`docs/dispatch_context_model.md`).
+None of the reasoning below depends on it. What Task 008's design rests on:
 
 - one authorization per dispatch comes from the step state, which only moves forward, and from
   the single transaction;
@@ -230,7 +243,7 @@ Nothing new is stored. What the design rests on:
   `attempts_used <= max_attempts`;
 - identity comes from the one dispatch row per step.
 
-What version 3 cannot express, none of it needed for the guarantee above:
+What the schema cannot express for this operation, none of it needed for the guarantee above:
 
 - the authorization time is not kept: `updated_at` is overwritten by later transitions;
 - an attempt cannot be attributed to a step from step states alone, because `FAILED`, `CANCELLED`

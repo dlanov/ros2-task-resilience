@@ -51,6 +51,11 @@ from task_resilience.model import SendAuthorization
 from task_resilience.state_machine import MissionState, StepState, transition_step
 from task_resilience.storage import MissionStore
 
+# The action every dispatch in these tests is declared to reach.
+ACTION = reconciliation.ExpectedActionContext(
+    action_name='/navigate_to_pose', action_type='nav2_msgs/action/NavigateToPose',
+    robot_namespace='/robot1')
+
 M = MissionState
 S = StepState
 
@@ -60,7 +65,7 @@ KEYS = ['checkpoint_a', 'return_to_base']
 ROUNDS = 25
 TIMEOUT = 10
 
-# The tables as version 3 defines them, written out here so a new column or table shows up.
+# The tables as version 4 defines them, written out here so a new column or table shows up.
 COLUMNS = {
     'missions': [
         'mission_id', 'request_id', 'request_fingerprint', 'request_json', 'max_attempts',
@@ -70,6 +75,7 @@ COLUMNS = {
         'mission_id', 'step_key', 'step_index', 'step_state', 'created_at', 'updated_at',
     ],
     'step_dispatches': ['dispatch_id', 'mission_id', 'step_key', 'created_at'],
+    'dispatch_contexts': ['dispatch_id', 'action_name', 'action_type', 'robot_namespace'],
 }
 
 # The step states a step can reach after its send was authorized, by an ordinary route.
@@ -136,7 +142,7 @@ def make_mission(store, request_id='req-001', max_attempts=3, keys=KEYS, prepare
     mission = store.create_or_get(request_id, {'goal': 'demo'}, max_attempts)
     store.initialize_steps(mission.mission_id, keys)
     for key in prepared:
-        store.prepare_step_dispatch(mission.mission_id, key)
+        store.prepare_step_dispatch(mission.mission_id, key, ACTION)
     for state in route:
         store.transition_mission_state(mission.mission_id, state)
     return mission.mission_id
@@ -381,7 +387,7 @@ def test_replaying_preparation_cannot_recreate_a_send_permission(store, db_path)
     before = dump(db_path)
 
     with pytest.raises(InvalidStateTransition):
-        store.prepare_step_dispatch(mission_id, 'checkpoint_a')
+        store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION)
     with pytest.raises(StepNotAwaitingSend):
         store.authorize_step_send(mission_id, 'checkpoint_a')
 
@@ -393,7 +399,7 @@ def test_replaying_preparation_before_authorization_returns_the_same_dispatch(st
     mission_id = make_mission(store)
     prepared = store.get_step_dispatch(mission_id, 'checkpoint_a')
 
-    assert store.prepare_step_dispatch(mission_id, 'checkpoint_a') == prepared
+    assert store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION) == prepared
     receipt = store.authorize_step_send(mission_id, 'checkpoint_a')
 
     assert receipt.dispatch_id == prepared.dispatch_id
@@ -588,10 +594,11 @@ def test_a_migrated_prepared_step_without_an_identity_cannot_be_authorized(db_pa
     with MissionStore(db_path) as store:
         mission_id = make_mission(store, prepared=[])
     # Rewind to what a version 2 database holds: a step already prepared, with no
-    # dispatch table at all. Opening it migrates it for real.
+    # dispatch or context table at all. Opening it migrates it for real.
     with contextlib.closing(sqlite3.connect(db_path, isolation_level=None)) as conn:
         conn.execute("UPDATE mission_steps SET step_state = 'DISPATCH_PREPARED'"
                      " WHERE step_key = 'checkpoint_a'")
+        conn.execute('DROP TABLE dispatch_contexts')
         conn.execute('DROP TABLE step_dispatches')
         conn.execute('PRAGMA user_version = 2')
 
@@ -602,8 +609,9 @@ def test_a_migrated_prepared_step_without_an_identity_cannot_be_authorized(db_pa
 
         assert 'DISPATCH_PREPARED' in excinfo.value.reason
         assert dump(db_path) == before
-    assert raw(db_path, 'PRAGMA user_version') == [(3,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(4,)]
     assert raw(db_path, 'SELECT COUNT(*) FROM step_dispatches') == [(0,)]
+    assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_contexts') == [(0,)]
 
 
 # Direct entry to DISPATCHED
@@ -1230,11 +1238,11 @@ def test_importing_the_store_loads_no_ros_network_or_llm_package():
     assert child.stdout.strip() == '[]'
 
 
-def test_the_schema_is_still_version_3_with_the_same_tables_and_columns(db_path):
+def test_the_schema_is_version_4_with_exactly_the_expected_tables_and_columns(db_path):
     MissionStore(db_path).close()
 
-    assert storage.SCHEMA_VERSION == 3
-    assert raw(db_path, 'PRAGMA user_version') == [(3,)]
+    assert storage.SCHEMA_VERSION == 4
+    assert raw(db_path, 'PRAGMA user_version') == [(4,)]
     tables = {name for (name,) in raw(
         db_path, "SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert tables == set(COLUMNS)

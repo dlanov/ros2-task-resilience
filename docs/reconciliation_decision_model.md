@@ -47,8 +47,10 @@ acts on a decision. Whether the step state and the dispatch agree (for example, 
 that has a dispatch) is the store's invariant. It is not checked here.
 
 **`ExpectedActionContext`**: `action_name`, `action_type`, `robot_namespace`, all exact strings.
-Schema version 3 does not persist them, so the caller supplies them and this model is not
-allowed to guess them. Nothing is normalized or inferred: `/robot1` and `robot1` differ, and so
+This model takes them as input and is not allowed to guess them. Schema version 3 did not persist
+them. Since Task 009 (schema version 4) they are bound to each dispatch when it is first prepared
+(`docs/dispatch_context_model.md`); a dispatch that predates version 4 has none, and none is added
+later. Nothing here reads the store: a later task is expected to build this type from that binding. Nothing is normalized or inferred: `/robot1` and `robot1` differ, and so
 do `''` and `/`. `action_name` and `action_type` must be non-empty. An empty `robot_namespace`
 is accepted as an exact value; whether it means the root namespace is the caller's convention.
 
@@ -221,9 +223,12 @@ Task 008 has since settled the meaning of an attempt and how one is consumed, an
 authorization as a separate storage API. It adds no leases, fencing or single-supervisor
 exclusion.
 
-Also not done: mapping ROS messages onto observations (an adapter), persisting the expected
-action context, any notion of time, freshness or server epoch, and a policy for resolving an
-`EVIDENCE_CONFLICT`.
+Task 009 has since added schema version 4 with the durable action context of a dispatch, and
+nothing else from this list: no evidence storage, no application of a reconciliation state, and no
+mission transition. This model is unchanged and still calls nothing.
+
+Also not done: mapping ROS messages onto observations (an adapter), any notion of time, freshness
+or server epoch, and a policy for resolving an `EVIDENCE_CONFLICT`.
 
 ## Connection to Task 006
 

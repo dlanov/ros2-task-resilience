@@ -3,7 +3,7 @@
 > **Working title:** ROS 2 Task Resilience
 > **Working repository name:** `ros2-task-resilience`
 > **Initial ROS packages:** `task_resilience_msgs`, `task_resilience`, `task_resilience_demos`
-> **Status:** Phase 1 (durable mission core) in progress. The ROS-independent core, the Task 006 recovery spike and the Task 007 reconciliation decision model are committed; Task 008 (send authorization and attempt semantics) is complete.
+> **Status:** Phase 1 (durable mission core) in progress. The ROS-independent core, the Task 006 recovery spike and the Task 007 reconciliation decision model are committed; Task 008 (send authorization and attempt semantics) is complete; Task 009 (the durable action context of a dispatch, schema version 4) is complete.
 > **Last updated:** 2026-09-24
 > **Primary maintainer:** Dennis Lanov
 
@@ -387,44 +387,59 @@ The first interface set should remain minimal. Do not create messages merely bec
 
 SQLite is the initial persistence mechanism.
 
-### Implemented so far (schema version 3)
+### Implemented so far (schema version 4)
 
-The schema version is `PRAGMA user_version`. A version 1 or version 2 database migrates to version 3 when it is opened, in one transaction.
+The schema version is `PRAGMA user_version`. A version 1, 2 or 3 database migrates to version 4 when it is opened, in one transaction.
 
 - `missions`: mission ID, external request ID, request fingerprint and canonical payload, attempt limit and attempts used, `mission_state`, and created/updated timestamps.
 - `mission_steps`: mission ID, caller-supplied stable `step_key`, `step_index` (order), `step_state`, and created/updated timestamps. Nothing else is stored per step yet.
 - `step_dispatches`: the durable dispatch UUID of a step, with the mission ID, step key and creation time. At most one per step. A step that was never prepared through the store has none.
+- `dispatch_contexts`: the action a dispatch is declared to reach, keyed by its dispatch UUID: `action_name`, `action_type` and `robot_namespace`, exact strings. At most one per dispatch. A dispatch that predates version 4 has none, and none is made up.
 
 Every state change is validated by the state model (section 13) inside a write transaction.
 
 ### Dispatch identity
 
-Preparing a step for dispatch reserves a durable UUID and moves the step from `PENDING` to `DISPATCH_PREPARED` in one transaction. That commit only reserves the identity, and the UUID stays reserved whether or not anything is ever sent. `DISPATCH_PREPARED` does not authorize an external send: an external send may be attempted only by the caller that successfully returns from `authorize_step_send`, described under "Send authorization and attempts" below. Even a committed authorization (`DISPATCHED`) does not prove that a send actually happened. Preparing the same step again returns the same UUID. Preparation does not consume an attempt.
+Preparing a step for dispatch reserves a durable UUID, binds the action context the dispatch is declared to reach, and moves the step from `PENDING` to `DISPATCH_PREPARED` in one transaction. That commit only reserves the identity and declares the action, and both stay whether or not anything is ever sent. `DISPATCH_PREPARED` does not authorize an external send: an external send may be attempted only by the caller that successfully returns from `authorize_step_send`, described under "Send authorization and attempts" below. Even a committed authorization (`DISPATCHED`) does not prove that a send actually happened. Preparing the same step again with the same context returns the same UUID, a different context raises `DispatchContextConflict`, and a dispatch with no context raises `DispatchContextMissing` and is not repaired. Preparation does not consume an attempt.
 
 The durable invariants:
 
 - A `PENDING` step never has a dispatch row through the normal APIs.
-- `prepare_step_dispatch` commits `DISPATCH_PREPARED` and the dispatch row atomically. A plain state transition cannot enter `DISPATCH_PREPARED`; it raises `DispatchPreparationRequired`.
+- `prepare_step_dispatch` commits `DISPATCH_PREPARED`, the dispatch row and its action context atomically. A plain state transition cannot enter `DISPATCH_PREPARED`; it raises `DispatchPreparationRequired`.
+- Any context created by supported schema version 4 code was committed atomically with its dispatch's first preparation. No supported operation binds, backfills, updates or repairs one afterwards.
 - A later state keeps the dispatch row, `CANCELLED` included. The row is historical evidence that preparation occurred, and it is not deleted because the step's current state changes.
 - A step already stored as `DISPATCH_PREPARED` by an earlier schema version may have no dispatch. It is migrated as it was and is not repaired; no identity is made up for it.
+- A `DISPATCH_PREPARED` step that has a dispatch UUID and no context is not repaired and is not guessed to be a migrated row: it fails closed with `DispatchContextMissing` (see "Dispatch action context" below).
 
 Migrated in-flight step states that predate durable dispatch IDs are preserved, but ordinary progression is blocked until a later reconciliation mechanism resolves the missing dispatch identity.
 
-`DISPATCH_PREPARED` means only that this identity was reserved. It does not mean the request was sent, received or accepted, and it does not make a blind resend after a crash safe: a crash can happen after the external send but before local state advances, and recovery has to reconcile that.
+`DISPATCH_PREPARED` means only that this identity was reserved and its action context declared. No send has been authorized: under the supported path an external send is not permitted while the durable state is `DISPATCH_PREPARED`, and an authorization first commits `DISPATCHED`. Nothing stops an older or bypassing program from sending anyway, so the state does not by itself prove that no request left the process. After an authorization, `DISPATCHED` can remain in the store although a send happened, if the process crashed before a later acceptance or execution state was recorded, and it can equally remain although no send happened. So recovery of `DISPATCHED` and of any later unresolved state still needs reconciliation, and a blind resend is not safe.
 
 The future ROS adapter is expected to convert the durable `dispatch_id` into the explicit `goal_uuid` argument of `rclpy`'s `ActionClient.send_goal_async`. A stable goal UUID helps correlate the same external request. It does not guarantee exactly-once execution if the action server restarts or forgets the goal, so recovery stays conservative. The Task 006 spike reported measurements of this on stock Nav2 under the tested conditions: see `docs/ros_action_recovery_spike.md`.
+
+### Dispatch action context
+
+Task 009. Full description: `docs/dispatch_context_model.md`.
+
+- The context is **declared intent, not proof** of where a request was actually sent. It is bound before the send can be authorized, so a later reader does not depend on whichever process is recovering.
+- The primary key gives one context row per dispatch. It does not make the row physically immutable. Immutability is a contract of the supported code: only the first preparation of a step inserts a context, there is no public update, replace or repair method, and production code never updates or deletes a row of the table.
+- Migration to version 4 is a pure `CREATE TABLE`. It creates no context for an existing dispatch and invents no action name, type or namespace.
+- There is **no late binding and no backfill**. A missing context is ambiguous: it may be a dispatch prepared under version 3 that never had one, or a version 4 dispatch whose context was removed outside the supported code, and version 4 stores nothing that tells them apart. Supported code therefore fails closed. For a `DISPATCH_PREPARED` step with a UUID and no context, `get_dispatch_context`, `authorize_step_send` and a `prepare_step_dispatch(..., action)` replay all raise `DispatchContextMissing`, consume no attempt, and change no row, state or timestamp. A step that was `PENDING` when migrated gets a UUID and a context together when it is first prepared.
+- Every migrated dispatch that predates a context, whatever its state, stays unbound and is unavailable to a future evidence-backed reconciliation until some separately reviewed mechanism exists. An explicit legacy or operator-attestation mechanism could be designed later if it is needed. It is not designed or implemented.
+- Correlating a result to an action is a different problem from proving the correct goal body was sent. No goal body or goal hash is stored, and that is deferred until the project has a durable per-step goal specification.
+- Task 009 stores the declared context and nothing more. Recording recovery evidence and applying a reconciliation outcome are Task 010.
 
 ### Send authorization and attempts
 
 **One attempt is one committed authorization to send one external step request.** The counter (`attempts_used` against `max_attempts`) is mission-wide, and preparation consumes none.
 
-`MissionStore.authorize_step_send(mission_id, step_key)` is the only operation that increases `attempts_used`, and the only one that enters `DISPATCHED`. In one write transaction it checks that the mission is `RUNNING`, that the step is exactly `DISPATCH_PREPARED`, that no step of the mission is `OUTCOME_UNKNOWN`, that the step's dispatch UUID exists and is valid, and that an attempt remains. It then takes one attempt and moves the step to `DISPATCHED`, with one UTC timestamp for both rows. It returns a `SendAuthorization` receipt only after the commit. Nothing external happens inside the transaction. The public `consume_attempt` was removed, and a plain state transition into `DISPATCHED` raises `SendAuthorizationRequired`. See `docs/send_authorization_model.md`.
+`MissionStore.authorize_step_send(mission_id, step_key)` is the only operation that increases `attempts_used`, and the only one that enters `DISPATCHED`. In one write transaction it checks that the mission is `RUNNING`, that the step is exactly `DISPATCH_PREPARED`, that no step of the mission is `OUTCOME_UNKNOWN`, that the step's dispatch UUID exists and is valid, that the dispatch has a valid bound action context, and that an attempt remains. It then takes one attempt and moves the step to `DISPATCHED`, with one UTC timestamp for both rows. It returns a `SendAuthorization` receipt only after the commit. Nothing external happens inside the transaction. The public `consume_attempt` was removed, and a plain state transition into `DISPATCHED` raises `SendAuthorizationRequired`. See `docs/send_authorization_model.md`.
 
 - `DISPATCHED` means a send authorization was durably committed. The external request may or may not have been sent or received. It does not mean sent, received, accepted or executing.
 - The guarantee is at most one successful authorization return per prepared dispatch. If the process dies after the commit and before its caller receives the receipt, no later caller gets another one. That can mean no send at all, and never a second authorization.
 - An attempt is never refunded automatically: not by a restart, a crash, a rejection, a timeout, an unavailable service, a transport error, a server `UNKNOWN`, or a later cancellation. No retry is authorized by this design.
 - Every new increment made by `authorize_step_send` is a committed send authorization. A nonzero `attempts_used` that predates Task 008, produced by the removed `consume_attempt`, is kept as spent budget. Its cause is not reconstructed, and it is never refunded.
-- Schema version 3 allows one dispatch identity per step, so budget beyond the number of steps cannot yet be used as retries. A future retry would consume another mission-wide unit and must use a new dispatch identity.
+- The schema allows one dispatch identity per step, so budget beyond the number of steps cannot yet be used as retries. A future retry would consume another mission-wide unit and must use a new dispatch identity.
 
 The concepts below are the longer-term minimum. Only the parts listed above are implemented.
 
@@ -697,7 +712,7 @@ general robot autonomy framework
 
 These should be resolved by implementation evidence rather than speculation:
 
-1. Exact mission/action schema. (The persisted mission/step schema is implemented as version 3; the ROS action schema is still open.)
+1. Exact mission/action schema. (The persisted mission/step schema is implemented as version 4; the ROS action schema is still open.)
 2. Exact transaction boundaries around Nav2 dispatch. (The boundary of the send authorization is settled by Task 008; the adapter's send and the recording of its result are not.)
 3. How much downstream ROS action state can be reconciled after different crash timings.
 4. Whether to expose attempt budgets in the public action interface in v0.1.
@@ -721,6 +736,7 @@ Phase 1 (section 16) is the current milestone. It proceeds in bounded tasks:
 - Task 006, ROS action recovery spike: **COMPLETE**. A research spike, not production code. It reported what a fresh process can learn about a Nav2 `NavigateToPose` goal from its UUID alone (`docs/ros_action_recovery_spike.md`, scripts in `task_resilience_demos/scripts/`). Findings, limited to the inspected `rclpy` 7.1.11 and the tested Nav2 1.3.13 loopback setup on one host: the public `rclpy` API has no way to turn a UUID into a goal handle or fetch a result by UUID; the `/navigate_to_pose/_action/get_result` protocol service answered by UUID for as long as the server retained the goal (900 s in the stock `nav2_params.yaml`; a finished goal's result was reported retrievable at 882.5 s and gone at 902.2 s); in the two tested restarts (one clean, one SIGKILL) the restarted server returned `UNKNOWN` for goals that had been retained or active before the restart and accepted the same UUID again; and resubmitting a UUID the server still tracked aborted the Nav2 container in 7 of 7 planned trials (as reported). A pending or timed-out request is not evidence about the goal. `task_resilience` was not changed.
 - Task 007, reconciliation decision model: **COMPLETE**. A pure decision function (`task_resilience/reconciliation.py`) that says what one recovery observation can establish about a dispatch. It changes no state and never authorizes a send (`docs/reconciliation_decision_model.md`).
 - Task 008, atomic send authorization and attempt semantics: **COMPLETE**. One attempt is one committed authorization to send one external step request, and `MissionStore.authorize_step_send` is the only way to take one and the only way to enter `DISPATCHED`. No schema change (version 3). See `docs/send_authorization_model.md`.
+- Task 009, immutable durable dispatch action context: **COMPLETE**. The action name, type and robot namespace a dispatch is declared to reach are bound to it, together with its UUID and `DISPATCH_PREPARED`, in one transaction (schema version 4, one new table). Declared intent, not proof of where a request was sent. `authorize_step_send` requires a bound context. No evidence is stored and no reconciliation is applied. See `docs/dispatch_context_model.md`.
 
 ### M0: Hardware-Free Nav2 Baseline — COMPLETE
 

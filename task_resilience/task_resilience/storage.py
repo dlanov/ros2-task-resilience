@@ -24,8 +24,11 @@ import uuid
 
 from .errors import (
     AttemptLimitReached,
+    CorruptDispatchContext,
     CorruptDispatchRecord,
     CorruptStoredState,
+    DispatchContextConflict,
+    DispatchContextMissing,
     DispatchNotFound,
     DispatchPreparationRequired,
     IdempotencyConflict,
@@ -39,6 +42,7 @@ from .errors import (
     UnsupportedSchemaVersion,
 )
 from .model import (
+    DispatchContextRecord,
     DispatchRecord,
     MissionRecord,
     MissionRequest,
@@ -46,9 +50,10 @@ from .model import (
     StepRecord,
     validate_step_keys,
 )
+from .reconciliation import ExpectedActionContext
 from .state_machine import MissionState, StepState, transition_mission, transition_step
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _State = TypeVar('_State', bound=enum.Enum)
 
@@ -118,6 +123,22 @@ CREATE TABLE step_dispatches (
 )
 """
 
+# The action a dispatch was declared to reach, kept apart from step_dispatches for the same
+# reason that table is kept apart from mission_steps: dispatches that already exist keep their
+# schema and are not given made-up contexts. No row means no context is bound. The primary key
+# allows one row per dispatch. It does not make a row immutable: only the first preparation of
+# a step inserts a row, and no code updates or deletes one. Nothing else stops a writer that
+# bypasses the code.
+_DISPATCH_CONTEXTS_DDL = """
+CREATE TABLE dispatch_contexts (
+    dispatch_id     TEXT NOT NULL PRIMARY KEY
+                    REFERENCES step_dispatches (dispatch_id) ON DELETE CASCADE,
+    action_name     TEXT NOT NULL CHECK (action_name <> ''),
+    action_type     TEXT NOT NULL CHECK (action_type <> ''),
+    robot_namespace TEXT NOT NULL
+)
+"""
+
 _RENAME_V1_MISSIONS = 'ALTER TABLE missions RENAME TO missions_v1'
 
 _COPY_V1_MISSIONS = """
@@ -177,6 +198,17 @@ _INSERT_DISPATCH = """
 INSERT INTO step_dispatches (dispatch_id, mission_id, step_key, created_at)
 VALUES (?, ?, ?, ?)
 """
+
+_CONTEXT_OF_DISPATCH = 'SELECT * FROM dispatch_contexts WHERE dispatch_id = ?'
+
+# The only statement that writes dispatch_contexts, and only the first preparation of a step
+# runs it. There is no later binding, backfill or repair.
+_INSERT_CONTEXT = """
+INSERT INTO dispatch_contexts (dispatch_id, action_name, action_type, robot_namespace)
+VALUES (?, ?, ?, ?)
+"""
+
+_CONTEXT_FIELDS = ('action_name', 'action_type', 'robot_namespace')
 
 
 def _utc_now() -> str:
@@ -239,6 +271,26 @@ def _to_dispatch(row: sqlite3.Row) -> DispatchRecord:
         mission_id=row['mission_id'],
         step_key=row['step_key'],
         created_at=datetime.fromisoformat(row['created_at']),
+    )
+
+
+def _to_context(row: sqlite3.Row, dispatch: DispatchRecord) -> DispatchContextRecord:
+    # The schema's checks should make this unreachable. If a row was changed behind our
+    # back, fail loudly rather than treat it as the action the dispatch was declared for.
+    for column in _CONTEXT_FIELDS:
+        if not isinstance(row[column], str):
+            raise CorruptDispatchContext(
+                dispatch.mission_id, dispatch.step_key, f'{column} is not text', row[column])
+    if not row['action_name'] or not row['action_type']:
+        raise CorruptDispatchContext(
+            dispatch.mission_id, dispatch.step_key, 'action_name and action_type are empty')
+    return DispatchContextRecord(
+        dispatch_id=dispatch.dispatch_id,
+        mission_id=dispatch.mission_id,
+        step_key=dispatch.step_key,
+        action_name=row['action_name'],
+        action_type=row['action_type'],
+        robot_namespace=row['robot_namespace'],
     )
 
 
@@ -375,7 +427,22 @@ class MissionStore:
                 _SET_STEP_STATE, (new_state.value, _utc_now(), mission_id, step_key))
             return self._require_step(mission_id, step_key)
 
-    def prepare_step_dispatch(self, mission_id: str, step_key: str) -> DispatchRecord:
+    def prepare_step_dispatch(
+        self, mission_id: str, step_key: str, action: ExpectedActionContext,
+    ) -> DispatchRecord:
+        """
+        Reserve the step's dispatch identity, and bind the action it is declared to reach.
+
+        The identity, the action context and DISPATCH_PREPARED commit together, and this
+        first preparation is the only thing that ever binds a context. The context is declared
+        intent, not proof of where a request is sent, and preparing authorizes no send.
+        Replaying with the same context changes nothing; a different one raises
+        DispatchContextConflict; a dispatch with no context raises DispatchContextMissing.
+        A replay writes nothing, and a context is never replaced or added afterwards.
+        """
+        # Before any database access, like the other argument checks.
+        if not isinstance(action, ExpectedActionContext):
+            raise TypeError(f'action must be an ExpectedActionContext, got {action!r}')
         with self._transaction():
             step = self._require_step(mission_id, step_key)
             # The state machine decides. The same state means this is a replay,
@@ -388,19 +455,23 @@ class MissionStore:
                 if existing is None:
                     raise CorruptDispatchRecord(
                         mission_id, step_key, f'step is {step.state.value} but has no dispatch')
+                self._require_matching_context(existing, action)
                 return existing
             if existing is not None:
                 raise CorruptDispatchRecord(
                     mission_id, step_key, f'step is {step.state.value} but already has a dispatch',
                     str(existing.dispatch_id))
 
-            # The ID and DISPATCH_PREPARED commit together. That only reserves the
-            # identity, and it stays reserved whether or not anything is ever sent.
-            # It does not authorize an external send: authorize_step_send is the
-            # separate operation that does.
+            # The ID, the context and DISPATCH_PREPARED commit together. That only reserves the
+            # identity and declares the action, and both stay whether or not anything is ever
+            # sent. It does not authorize an external send: authorize_step_send is the
+            # separate operation that does. This is the only place a context is inserted.
             dispatch_id = uuid.uuid4()
             now = _utc_now()
             self._conn.execute(_INSERT_DISPATCH, (str(dispatch_id), mission_id, step_key, now))
+            self._conn.execute(_INSERT_CONTEXT, (
+                str(dispatch_id), action.action_name, action.action_type,
+                action.robot_namespace))
             self._conn.execute(_SET_STEP_STATE, (new_state.value, now, mission_id, step_key))
             return self._require_dispatch(mission_id, step_key)
 
@@ -408,7 +479,8 @@ class MissionStore:
         """
         Authorize the one send of a prepared step, consuming one attempt for it.
 
-        The checks and both writes are a single transaction, and the receipt is returned
+        The step's dispatch must also have a bound action context. The checks and both
+        writes are a single transaction, and the receipt is returned
         only once it has committed. Nothing external happens in here: the caller sends
         afterwards, and only a caller that got a receipt may. A replay is refused and is
         never answered with the earlier receipt. A committed authorization is not undone,
@@ -436,6 +508,10 @@ class MissionStore:
             if dispatch is None:
                 raise CorruptDispatchRecord(
                     mission_id, step_key, f'step is {step.state.value} but has no dispatch')
+
+            # The action the dispatch is declared to reach must be bound before any send can be
+            # authorized. Like the checks above, this comes before anything is written.
+            self._require_context(dispatch)
 
             # The state machine still decides that this edge exists.
             new_state = transition_step(step.state, StepState.DISPATCHED)
@@ -467,6 +543,11 @@ class MissionStore:
             raise DispatchNotFound(dispatch_id=dispatch_id)
         return _to_dispatch(row)
 
+    def get_dispatch_context(self, mission_id: str, step_key: str) -> DispatchContextRecord:
+        """Return the action context bound to the step's dispatch. Never binds or repairs one."""
+        self._require_step(mission_id, step_key)
+        return self._require_context(self._require_dispatch(mission_id, step_key))
+
     @contextlib.contextmanager
     def _transaction(self) -> Iterator[None]:
         # IMMEDIATE takes the write lock up front. A deferred transaction that
@@ -495,12 +576,15 @@ class MissionStore:
                 self._conn.execute(_MISSIONS_DDL)
                 self._conn.execute(_MISSION_STEPS_DDL)
                 self._conn.execute(_STEP_DISPATCHES_DDL)
-            elif version in (1, 2):
-                # A version 1 database goes through both steps inside this one
-                # transaction, so version 2 is never committed on the way.
+                self._conn.execute(_DISPATCH_CONTEXTS_DDL)
+            elif version in (1, 2, 3):
+                # An older database goes through every step up to the current version inside
+                # this one transaction, so no version in between is ever committed.
                 if version == 1:
                     self._migrate_v1_to_v2()
-                self._migrate_v2_to_v3()
+                if version <= 2:
+                    self._migrate_v2_to_v3()
+                self._migrate_v3_to_v4()
             else:
                 raise UnsupportedSchemaVersion(version)
             self._conn.execute(f'PRAGMA user_version = {SCHEMA_VERSION}')
@@ -520,6 +604,11 @@ class MissionStore:
         # Existing steps get no dispatch: none of them was prepared through this
         # code, and an ID would be invented.
         self._conn.execute(_STEP_DISPATCHES_DDL)
+
+    def _migrate_v3_to_v4(self) -> None:
+        # Only a table is added. Existing dispatches get no context: none was declared,
+        # and an action name, type or namespace would be invented.
+        self._conn.execute(_DISPATCH_CONTEXTS_DDL)
 
     def _fetch(self, query: str, value: str) -> MissionRecord | None:
         row = self._conn.execute(query, (value,)).fetchone()
@@ -559,3 +648,26 @@ class MissionStore:
         if dispatch is None:
             raise DispatchNotFound(mission_id=mission_id, step_key=step_key)
         return dispatch
+
+    def _fetch_context(self, dispatch: DispatchRecord) -> DispatchContextRecord | None:
+        row = self._conn.execute(_CONTEXT_OF_DISPATCH, (str(dispatch.dispatch_id),)).fetchone()
+        return None if row is None else _to_context(row, dispatch)
+
+    def _require_context(self, dispatch: DispatchRecord) -> DispatchContextRecord:
+        context = self._fetch_context(dispatch)
+        if context is None:
+            raise DispatchContextMissing(dispatch.mission_id, dispatch.step_key)
+        return context
+
+    def _require_matching_context(
+        self, dispatch: DispatchRecord, action: ExpectedActionContext,
+    ) -> None:
+        # Reads only. A missing context is never inserted here, and never guessed to be a
+        # legacy row: version 4 has nothing that tells a version 3 dispatch that never had a
+        # context from one whose context was removed by something outside this code, so both
+        # fail closed with DispatchContextMissing (a malformed one, CorruptDispatchContext).
+        bound = self._require_context(dispatch)
+        differing = tuple(
+            name for name in _CONTEXT_FIELDS if getattr(bound, name) != getattr(action, name))
+        if differing:
+            raise DispatchContextConflict(dispatch.mission_id, dispatch.step_key, differing)

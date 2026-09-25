@@ -136,6 +136,37 @@ class DispatchRecord:
 
 
 @dataclass(frozen=True)
+class DispatchContextRecord:
+    """
+    The action context bound to a dispatch, as stored.
+
+    It is what was declared when the dispatch was prepared: the action its request was
+    meant to reach. It is neither an authorization nor proof that a request was ever sent
+    there. The three strings are exact and never normalized.
+    """
+
+    dispatch_id: uuid.UUID
+    mission_id: str
+    step_key: str
+    action_name: str
+    action_type: str
+    robot_namespace: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.dispatch_id, uuid.UUID):
+            raise TypeError(f'dispatch_id must be a uuid.UUID, got {self.dispatch_id!r}')
+        for name in ('mission_id', 'step_key', 'action_name', 'action_type', 'robot_namespace'):
+            value = getattr(self, name)
+            if not isinstance(value, str):
+                raise TypeError(f'{name} must be a str, got {value!r}')
+        if not self.mission_id or not self.step_key:
+            raise ValueError('mission_id and step_key must not be empty')
+        # The namespace is different: an empty string is an exact value.
+        if not self.action_name or not self.action_type:
+            raise ValueError('action_name and action_type must be non-empty')
+
+
+@dataclass(frozen=True)
 class SendAuthorization:
     """
     The receipt of a send authorization that has been committed.

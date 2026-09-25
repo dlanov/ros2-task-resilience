@@ -83,10 +83,10 @@ def check_list(conn, table, column):
     return re.findall(r"'([^']*)'", match.group(1))
 
 
-def test_fresh_database_is_created_at_version_3(conn):
-    assert conn.execute('PRAGMA user_version').fetchone()[0] == 3
+def test_fresh_database_is_created_at_version_4(conn):
+    assert conn.execute('PRAGMA user_version').fetchone()[0] == 4
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert tables == {'missions', 'mission_steps', 'step_dispatches'}
+    assert tables == {'missions', 'mission_steps', 'step_dispatches', 'dispatch_contexts'}
 
 
 def test_missions_table_gains_only_mission_state(conn):

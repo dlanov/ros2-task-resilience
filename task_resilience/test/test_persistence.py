@@ -27,8 +27,14 @@ from task_resilience.errors import (
     IdempotencyConflict,
     UnsupportedSchemaVersion,
 )
+from task_resilience.reconciliation import ExpectedActionContext
 from task_resilience.state_machine import MissionState
 from task_resilience.storage import MissionStore
+
+# The action every dispatch in these tests is declared to reach.
+ACTION = ExpectedActionContext(
+    action_name='/navigate_to_pose', action_type='nav2_msgs/action/NavigateToPose',
+    robot_namespace='/robot1')
 
 KEYS = ['checkpoint_a', 'return_to_base', 'final_check']
 
@@ -44,7 +50,7 @@ def running_mission(store, request_id, max_attempts, keys=KEYS[:2]):
     store.initialize_steps(mission.mission_id, keys)
     store.transition_mission_state(mission.mission_id, MissionState.RUNNING)
     for key in keys:
-        store.prepare_step_dispatch(mission.mission_id, key)
+        store.prepare_step_dispatch(mission.mission_id, key, ACTION)
     return mission.mission_id
 
 
@@ -139,10 +145,10 @@ def test_attempt_survives_a_process_that_exits_abruptly(db_path):
 def test_schema_version_is_recorded(db_path):
     MissionStore(db_path).close()
 
-    assert pragma(db_path, 'user_version') == 3
+    assert pragma(db_path, 'user_version') == 4
 
 
-@pytest.mark.parametrize('version', [4, 99, -1])
+@pytest.mark.parametrize('version', [5, 99, -1])
 def test_unsupported_schema_version_is_refused_and_leaves_no_lock_behind(db_path, version):
     MissionStore(db_path).close()
     with contextlib.closing(sqlite3.connect(db_path)) as conn:

@@ -35,8 +35,14 @@ from task_resilience.errors import (
     StepNotFound,
 )
 from task_resilience.model import DispatchRecord
+from task_resilience.reconciliation import ExpectedActionContext
 from task_resilience.state_machine import MissionState, StepState
 from task_resilience.storage import MissionStore
+
+# The action every dispatch in these tests is declared to reach.
+ACTION = ExpectedActionContext(
+    action_name='/navigate_to_pose', action_type='nav2_msgs/action/NavigateToPose',
+    robot_namespace='/robot1')
 
 M = MissionState
 S = StepState
@@ -134,7 +140,7 @@ def test_preparing_a_pending_step_reserves_an_identity_and_moves_the_step(
     assert store.get_step(mission.mission_id, 'checkpoint_a').state is S.PENDING
     assert dispatch_count(db_path) == 0
 
-    record = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+    record = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
 
     assert isinstance(record, DispatchRecord)
     assert isinstance(record.dispatch_id, uuid.UUID)
@@ -149,7 +155,7 @@ def test_preparing_a_pending_step_reserves_an_identity_and_moves_the_step(
 def test_only_the_prepared_step_is_touched(store, mission, db_path):
     other_before = store.get_step(mission.mission_id, 'return_to_base')
 
-    store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+    store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
 
     assert store.get_step(mission.mission_id, 'return_to_base') == other_before
     with pytest.raises(DispatchNotFound):
@@ -159,7 +165,7 @@ def test_only_the_prepared_step_is_touched(store, mission, db_path):
 def test_preparation_stamps_the_step_like_any_state_change(store, mission):
     before = store.get_step(mission.mission_id, 'checkpoint_a')
 
-    store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+    store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
 
     after = store.get_step(mission.mission_id, 'checkpoint_a')
     assert after.updated_at > before.updated_at
@@ -168,7 +174,7 @@ def test_preparation_stamps_the_step_like_any_state_change(store, mission):
 
 
 def test_the_id_is_stored_as_canonical_uuid_text(store, mission, db_path):
-    record = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+    record = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
 
     assert raw(db_path, 'SELECT dispatch_id FROM step_dispatches') == [(str(record.dispatch_id),)]
 
@@ -178,16 +184,16 @@ def test_every_step_gets_its_own_identity(store, mission):
     store.initialize_steps(other.mission_id, KEYS)
 
     ids = {
-        store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a').dispatch_id,
-        store.prepare_step_dispatch(mission.mission_id, 'return_to_base').dispatch_id,
-        store.prepare_step_dispatch(other.mission_id, 'checkpoint_a').dispatch_id,
+        store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION).dispatch_id,
+        store.prepare_step_dispatch(mission.mission_id, 'return_to_base', ACTION).dispatch_id,
+        store.prepare_step_dispatch(other.mission_id, 'checkpoint_a', ACTION).dispatch_id,
     }
 
     assert len(ids) == 3
 
 
 def test_dispatch_record_is_read_only(store, mission):
-    record = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+    record = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
 
     with pytest.raises(AttributeError):
         record.dispatch_id = uuid.uuid4()
@@ -195,9 +201,9 @@ def test_dispatch_record_is_read_only(store, mission):
 
 def test_preparing_an_unknown_mission_or_step_fails(store, mission):
     with pytest.raises(MissionNotFound):
-        store.prepare_step_dispatch('no-such-mission', 'checkpoint_a')
+        store.prepare_step_dispatch('no-such-mission', 'checkpoint_a', ACTION)
     with pytest.raises(StepNotFound) as excinfo:
-        store.prepare_step_dispatch(mission.mission_id, 'no_such_step')
+        store.prepare_step_dispatch(mission.mission_id, 'no_such_step', ACTION)
 
     assert excinfo.value.step_key == 'no_such_step'
 
@@ -206,10 +212,10 @@ def test_preparing_an_unknown_mission_or_step_fails(store, mission):
 
 def test_preparing_again_returns_the_same_identity_and_changes_nothing(
         store, mission, db_path):
-    first = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+    first = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
     step_after_first = store.get_step(mission.mission_id, 'checkpoint_a')
 
-    second = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+    second = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
 
     assert second == first
     assert second.dispatch_id == first.dispatch_id
@@ -222,19 +228,19 @@ def test_the_identity_survives_reopening_the_store(db_path):
     with MissionStore(db_path) as store:
         created = store.create_or_get('req-001', {}, 1)
         store.initialize_steps(created.mission_id, KEYS)
-        first = store.prepare_step_dispatch(created.mission_id, 'checkpoint_a')
+        first = store.prepare_step_dispatch(created.mission_id, 'checkpoint_a', ACTION)
 
     with MissionStore(db_path) as reopened:
         assert reopened.get_step_dispatch(created.mission_id, 'checkpoint_a') == first
         assert reopened.get_dispatch(first.dispatch_id) == first
-        assert reopened.prepare_step_dispatch(created.mission_id, 'checkpoint_a') == first
+        assert reopened.prepare_step_dispatch(created.mission_id, 'checkpoint_a', ACTION) == first
         assert reopened.get_step(created.mission_id, 'checkpoint_a').state is (
             S.DISPATCH_PREPARED)
     assert dispatch_count(db_path) == 1
 
 
 def test_a_prepared_step_can_advance_and_keeps_its_identity(store, mission, running, db_path):
-    prepared = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+    prepared = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
 
     advance(store, mission.mission_id, 'checkpoint_a', S.SUCCEEDED)
 
@@ -247,11 +253,11 @@ def test_a_prepared_step_can_advance_and_keeps_its_identity(store, mission, runn
 @pytest.mark.parametrize('state', list(ROUTE_AFTER_PREPARE))
 def test_a_step_past_preparation_cannot_be_prepared_again(
         store, mission, running, db_path, state):
-    prepared = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+    prepared = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
     advance(store, mission.mission_id, 'checkpoint_a', state)
 
     with pytest.raises(InvalidStateTransition) as excinfo:
-        store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+        store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
 
     assert excinfo.value.entity == 'step'
     assert excinfo.value.current is state
@@ -271,7 +277,7 @@ def test_cancelling_before_preparation_leaves_no_dispatch_and_blocks_preparation
     with pytest.raises(DispatchNotFound):
         store.get_step_dispatch(mission.mission_id, 'checkpoint_a')
     with pytest.raises(InvalidStateTransition) as excinfo:
-        store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+        store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
 
     assert excinfo.value.current is S.CANCELLED
     assert dispatch_count(db_path) == 0
@@ -279,7 +285,7 @@ def test_cancelling_before_preparation_leaves_no_dispatch_and_blocks_preparation
 
 
 def test_cancelling_after_preparation_keeps_the_original_dispatch(store, mission, db_path):
-    prepared = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+    prepared = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
 
     cancelled = store.transition_step_state(mission.mission_id, 'checkpoint_a', S.CANCELLED)
 
@@ -288,7 +294,7 @@ def test_cancelling_after_preparation_keeps_the_original_dispatch(store, mission
     assert store.get_dispatch(prepared.dispatch_id) == prepared
     assert dispatch_count(db_path) == 1
     with pytest.raises(InvalidStateTransition):
-        store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+        store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
     assert store.get_step_dispatch(mission.mission_id, 'checkpoint_a') == prepared
 
 
@@ -296,7 +302,7 @@ def test_the_dispatch_of_a_cancelled_step_survives_reopening_the_store(db_path):
     with MissionStore(db_path) as store:
         created = store.create_or_get('req-001', {}, 1)
         store.initialize_steps(created.mission_id, KEYS)
-        prepared = store.prepare_step_dispatch(created.mission_id, 'checkpoint_a')
+        prepared = store.prepare_step_dispatch(created.mission_id, 'checkpoint_a', ACTION)
         store.transition_step_state(created.mission_id, 'checkpoint_a', S.CANCELLED)
 
     with MissionStore(db_path) as reopened:
@@ -327,7 +333,7 @@ def test_prepare_step_dispatch_is_the_supported_way_to_enter_dispatch_prepared(
     with pytest.raises(DispatchPreparationRequired):
         store.transition_step_state(mission.mission_id, 'checkpoint_a', S.DISPATCH_PREPARED)
 
-    record = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+    record = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
 
     assert store.get_step(mission.mission_id, 'checkpoint_a').state is S.DISPATCH_PREPARED
     assert store.get_step_dispatch(mission.mission_id, 'checkpoint_a') == record
@@ -338,7 +344,7 @@ def test_prepare_step_dispatch_is_the_supported_way_to_enter_dispatch_prepared(
 def test_the_refusal_does_not_depend_on_the_current_state(
         store, mission, running, db_path, state):
     if state is not S.PENDING:
-        store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+        store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
         advance(store, mission.mission_id, 'checkpoint_a', state)
     step_before = store.get_step(mission.mission_id, 'checkpoint_a')
     dispatches_before = raw(db_path, 'SELECT * FROM step_dispatches')
@@ -368,7 +374,7 @@ def test_the_refusal_is_raised_before_the_database_is_touched(db_path):
 
 
 def test_other_targets_still_use_the_plain_transition(store, mission, running):
-    store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+    store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
     store.authorize_step_send(mission.mission_id, 'checkpoint_a')
 
     moved = store.transition_step_state(mission.mission_id, 'checkpoint_a', S.ACCEPTED)
@@ -387,7 +393,7 @@ def test_preparation_still_asks_the_state_machine_to_validate_the_move(
 
     with monkeypatch.context() as patch:
         patch.setattr(storage, 'transition_step', spy)
-        store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+        store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
 
     assert calls == [(S.PENDING, S.DISPATCH_PREPARED)]
 
@@ -400,7 +406,7 @@ def test_a_state_machine_refusal_stops_preparation_and_writes_nothing(
     with monkeypatch.context() as patch:
         patch.setattr(storage, 'transition_step', refuse)
         with pytest.raises(InvalidStateTransition):
-            store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+            store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
 
     assert store.get_step(mission.mission_id, 'checkpoint_a').state is S.PENDING
     assert dispatch_count(db_path) == 0
@@ -483,7 +489,7 @@ def test_finished_and_unknown_steps_need_no_dispatch(store, mission, db_path, st
 @pytest.mark.parametrize(('state', 'exit_to'), IN_FLIGHT_EXITS)
 def test_the_same_transitions_work_when_the_step_was_prepared_through_the_store(
         store, mission, running, db_path, state, exit_to):
-    prepared = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+    prepared = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
     advance(store, mission.mission_id, 'checkpoint_a', state)
     assert store.get_step(mission.mission_id, 'checkpoint_a').state is state
 
@@ -496,7 +502,7 @@ def test_the_same_transitions_work_when_the_step_was_prepared_through_the_store(
 
 def test_an_in_flight_step_with_an_unreadable_dispatch_id_cannot_progress(
         store, mission, db_path):
-    store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+    store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
     raw(db_path, "UPDATE step_dispatches SET dispatch_id = 'not-a-uuid'")
 
     with pytest.raises(CorruptDispatchRecord) as excinfo:
@@ -517,7 +523,7 @@ def test_preparation_is_not_gated_on_the_mission_state(store, mission_state):
         store.transition_mission_state(created.mission_id, step)
     before = store.get_by_mission_id(created.mission_id)
 
-    record = store.prepare_step_dispatch(created.mission_id, 'checkpoint_a')
+    record = store.prepare_step_dispatch(created.mission_id, 'checkpoint_a', ACTION)
 
     assert record.step_key == 'checkpoint_a'
     assert store.get_by_mission_id(created.mission_id) == before
@@ -530,9 +536,9 @@ def test_preparation_does_not_consume_attempts(store, mission, db_path):
         mission.mission_id)
     before = store.get_by_mission_id(mission.mission_id)
 
-    store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
-    store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
-    store.prepare_step_dispatch(mission.mission_id, 'return_to_base')
+    store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
+    store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
+    store.prepare_step_dispatch(mission.mission_id, 'return_to_base', ACTION)
 
     assert store.get_by_mission_id(mission.mission_id) == before
     assert before.attempts_used == 1
@@ -544,7 +550,7 @@ def test_preparation_does_not_consume_attempts(store, mission, db_path):
 # Lookups
 
 def test_a_step_can_be_found_by_step_or_by_id(store, mission):
-    record = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+    record = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
 
     assert store.get_step_dispatch(mission.mission_id, 'checkpoint_a') == record
     assert store.get_dispatch(record.dispatch_id) == record
@@ -597,7 +603,7 @@ def test_failure_after_the_dispatch_insert_leaves_neither_change(monkeypatch, db
         connection.fail_when = lambda sql: sql.lstrip().startswith('UPDATE mission_steps')
 
         with pytest.raises(sqlite3.OperationalError, match='injected failure'):
-            store.prepare_step_dispatch(created.mission_id, 'checkpoint_a')
+            store.prepare_step_dispatch(created.mission_id, 'checkpoint_a', ACTION)
 
         # The row really was inserted first; the rollback is what removed it.
         assert any(sql.startswith('INSERT INTO step_dispatches') for sql in connection.statements)
@@ -609,7 +615,7 @@ def test_failure_after_the_dispatch_insert_leaves_neither_change(monkeypatch, db
             store.get_step_dispatch(created.mission_id, 'checkpoint_a')
 
         # And the store still works.
-        record = store.prepare_step_dispatch(created.mission_id, 'checkpoint_a')
+        record = store.prepare_step_dispatch(created.mission_id, 'checkpoint_a', ACTION)
         assert store.get_step(created.mission_id, 'checkpoint_a').state is S.DISPATCH_PREPARED
         assert dispatch_count(db_path) == 1
         assert store.get_dispatch(record.dispatch_id) == record
@@ -624,7 +630,7 @@ def test_failure_at_commit_leaves_neither_change(monkeypatch, db_path):
         connection.fail_when = lambda sql: sql.strip().upper() == 'COMMIT'
 
         with pytest.raises(sqlite3.OperationalError, match='injected failure'):
-            store.prepare_step_dispatch(created.mission_id, 'checkpoint_a')
+            store.prepare_step_dispatch(created.mission_id, 'checkpoint_a', ACTION)
 
         # Both writes ran; only the commit failed.
         assert any(sql.startswith('INSERT INTO step_dispatches') for sql in connection.statements)
@@ -634,8 +640,8 @@ def test_failure_at_commit_leaves_neither_change(monkeypatch, db_path):
         assert dispatch_count(db_path) == 0
         assert store.get_step(created.mission_id, 'checkpoint_a').state is S.PENDING
 
-        assert store.prepare_step_dispatch(created.mission_id, 'checkpoint_a').step_key == (
-            'checkpoint_a')
+        retried = store.prepare_step_dispatch(created.mission_id, 'checkpoint_a', ACTION)
+        assert retried.step_key == 'checkpoint_a'
         assert dispatch_count(db_path) == 1
 
 
@@ -645,10 +651,14 @@ _CHILD = """
 import os
 import sys
 
+from task_resilience.reconciliation import ExpectedActionContext
 from task_resilience.storage import MissionStore
 
 store = MissionStore(sys.argv[1])
-record = store.prepare_step_dispatch(sys.argv[2], sys.argv[3])
+action = ExpectedActionContext(
+    action_name='/navigate_to_pose', action_type='nav2_msgs/action/NavigateToPose',
+    robot_namespace='/robot1')
+record = store.prepare_step_dispatch(sys.argv[2], sys.argv[3], action)
 print(record.dispatch_id, flush=True)
 # Die without closing the store or running any cleanup.
 os._exit(0)
@@ -676,7 +686,7 @@ def test_a_prepared_dispatch_survives_a_process_that_exits_abruptly(db_path):
         found = reopened.get_step_dispatch(created.mission_id, 'checkpoint_a')
         assert found.dispatch_id == child_id
         # Preparing again must hand back the child's ID, not mint another.
-        assert reopened.prepare_step_dispatch(created.mission_id, 'checkpoint_a') == found
+        assert reopened.prepare_step_dispatch(created.mission_id, 'checkpoint_a', ACTION) == found
     assert dispatch_count(db_path) == 1
 
 
@@ -688,7 +698,7 @@ def test_a_pending_step_that_already_has_a_dispatch_is_inconsistent(store, missi
         planted, mission.mission_id, 'checkpoint_a', '2026-01-01T00:00:00.000000+00:00')
 
     with pytest.raises(CorruptDispatchRecord) as excinfo:
-        store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+        store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
 
     assert excinfo.value.mission_id == mission.mission_id
     assert excinfo.value.step_key == 'checkpoint_a'
@@ -702,7 +712,7 @@ def test_a_prepared_step_without_a_dispatch_is_inconsistent_and_gets_no_new_iden
                  " WHERE step_key = 'checkpoint_a'")
 
     with pytest.raises(CorruptDispatchRecord) as excinfo:
-        store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+        store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
 
     assert excinfo.value.mission_id == mission.mission_id
     assert excinfo.value.step_key == 'checkpoint_a'
@@ -725,7 +735,7 @@ def test_more_than_one_dispatch_for_a_step_is_inconsistent(store, mission, db_pa
                  " WHERE step_key = 'checkpoint_a'")
 
     with pytest.raises(CorruptDispatchRecord):
-        store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+        store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
     with pytest.raises(CorruptDispatchRecord):
         store.get_step_dispatch(mission.mission_id, 'checkpoint_a')
 
@@ -744,7 +754,7 @@ def test_more_than_one_dispatch_for_a_step_is_inconsistent(store, mission, db_pa
 ], ids=['garbage', 'empty', 'upper case', 'no hyphens', 'braces', 'urn', 'truncated', 'blob'])
 def test_an_unreadable_stored_id_is_an_error_and_is_never_replaced(
         store, mission, db_path, damage):
-    original = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a').dispatch_id
+    original = store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION).dispatch_id
     damaged = damage(str(original))
     raw(db_path, 'UPDATE step_dispatches SET dispatch_id = ?', damaged)
 
@@ -754,7 +764,7 @@ def test_an_unreadable_stored_id_is_an_error_and_is_never_replaced(
     assert excinfo.value.step_key == 'checkpoint_a'
     assert excinfo.value.value == damaged
     with pytest.raises(CorruptDispatchRecord):
-        store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a')
+        store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
 
     # No replacement was minted, and the damaged row was left as found.
     assert raw(db_path, 'SELECT dispatch_id FROM step_dispatches') == [(damaged,)]

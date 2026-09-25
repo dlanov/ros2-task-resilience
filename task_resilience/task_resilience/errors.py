@@ -194,3 +194,40 @@ class StepNotAwaitingSend(Exception):
         self.mission_id = mission_id
         self.step_key = step_key
         self.step_state = step_state
+
+
+class DispatchContextMissing(Exception):
+    """A dispatch exists, but no durable action context is bound to it."""
+
+    def __init__(self, mission_id: str, step_key: str) -> None:
+        super().__init__(
+            f'dispatch of step {step_key!r} of mission {mission_id!r} has no bound action context')
+        self.mission_id = mission_id
+        self.step_key = step_key
+
+
+class DispatchContextConflict(Exception):
+    """A dispatch is already bound to an action context, and the requested one differs."""
+
+    def __init__(self, mission_id: str, step_key: str, fields: tuple[str, ...]) -> None:
+        super().__init__(
+            f'dispatch of step {step_key!r} of mission {mission_id!r} is already bound to a '
+            f'different action context: {", ".join(fields)}')
+        self.mission_id = mission_id
+        self.step_key = step_key
+        # The names of the fields that differ, never the values.
+        self.fields = fields
+
+
+class CorruptDispatchContext(Exception):
+    """A dispatch's stored action context cannot be read as a valid context."""
+
+    def __init__(
+        self, mission_id: str, step_key: str, reason: str, value: object = None,
+    ) -> None:
+        super().__init__(
+            f'action context of step {step_key!r} of mission {mission_id!r}: {reason}')
+        self.mission_id = mission_id
+        self.step_key = step_key
+        self.reason = reason
+        self.value = value
