@@ -42,6 +42,12 @@ field combination raises `ValueError`.
 | `dispatch_id` | A `uuid.UUID`, or `None`. It has no default, so "this step has no durable dispatch UUID" must be said explicitly. |
 | `mission_id`, `step_key` | Optional, diagnostics only. |
 
+The snapshot has no field for the durable send-authorization record that Task 010 added
+(`docs/dispatch_authorization_model.md`), and no decision reads it. Whether supported code committed
+an authorization for the dispatch is therefore not something a decision can depend on, and a step
+that is `OUTCOME_UNKNOWN` gets the same decision with or without one. Whether and how a later task
+uses it is not decided here.
+
 The snapshot is taken as given. It is a point-in-time read and may be stale by the time anyone
 acts on a decision. Whether the step state and the dispatch agree (for example, a `PENDING` step
 that has a dispatch) is the store's invariant. It is not checked here.
@@ -226,6 +232,11 @@ exclusion.
 Task 009 has since added schema version 4 with the durable action context of a dispatch, and
 nothing else from this list: no evidence storage, no application of a reconciliation state, and no
 mission transition. This model is unchanged and still calls nothing.
+
+Task 010 has since added schema version 5 with one durable record per dispatch that supported code
+committed a send authorization for it (`docs/dispatch_authorization_model.md`). It stores no
+evidence either, and applies no reconciliation state. Storing terminal evidence and applying it to a
+step's state are expected in Task 011.
 
 Also not done: mapping ROS messages onto observations (an adapter), any notion of time, freshness
 or server epoch, and a policy for resolving an `EVIDENCE_CONFLICT`.

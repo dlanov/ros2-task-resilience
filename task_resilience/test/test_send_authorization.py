@@ -65,7 +65,7 @@ KEYS = ['checkpoint_a', 'return_to_base']
 ROUNDS = 25
 TIMEOUT = 10
 
-# The tables as version 4 defines them, written out here so a new column or table shows up.
+# The tables as version 5 defines them, written out here so a new column or table shows up.
 COLUMNS = {
     'missions': [
         'mission_id', 'request_id', 'request_fingerprint', 'request_json', 'max_attempts',
@@ -76,7 +76,11 @@ COLUMNS = {
     ],
     'step_dispatches': ['dispatch_id', 'mission_id', 'step_key', 'created_at'],
     'dispatch_contexts': ['dispatch_id', 'action_name', 'action_type', 'robot_namespace'],
+    'dispatch_authorizations': ['dispatch_id', 'authorized_at'],
 }
+
+# The one table that a committed authorization adds a row to. No other table gains or loses one.
+AUTHORIZATION_TABLE = 'dispatch_authorizations'
 
 # The step states a step can reach after its send was authorized, by an ordinary route.
 ROUTES_FROM_DISPATCHED = {
@@ -157,6 +161,9 @@ def changed_cells(before, after):
     """Return {(table, row key, column): (old, new)} for every cell that differs."""
     changes = {}
     for table, columns in COLUMNS.items():
+        if table == AUTHORIZATION_TABLE:
+            # It gains a row instead: the caller checks that row on its own.
+            continue
         assert len(before[table]) == len(after[table]), f'{table} gained or lost a row'
         for old, new in zip(before[table], after[table]):
             row_key = old[1] if table == 'mission_steps' else old[0]
@@ -235,6 +242,9 @@ def test_only_the_intended_cells_change(store, db_path):
     stamp = changes[('missions', mission_id, 'updated_at')][1]
     assert stamp == changes[('mission_steps', 'checkpoint_a', 'updated_at')][1]
     assert datetime.fromisoformat(stamp) == receipt.authorized_at
+    # The one row that is added: this dispatch and the same stamp, and nothing else in it.
+    assert before[AUTHORIZATION_TABLE] == []
+    assert after[AUTHORIZATION_TABLE] == [(str(receipt.dispatch_id), stamp)]
     # The dispatch row is untouched, and so is the other step.
     assert after['step_dispatches'] == before['step_dispatches']
     assert [row for row in after['mission_steps'] if row[1] == 'return_to_base'] == [
@@ -598,6 +608,7 @@ def test_a_migrated_prepared_step_without_an_identity_cannot_be_authorized(db_pa
     with contextlib.closing(sqlite3.connect(db_path, isolation_level=None)) as conn:
         conn.execute("UPDATE mission_steps SET step_state = 'DISPATCH_PREPARED'"
                      " WHERE step_key = 'checkpoint_a'")
+        conn.execute('DROP TABLE dispatch_authorizations')
         conn.execute('DROP TABLE dispatch_contexts')
         conn.execute('DROP TABLE step_dispatches')
         conn.execute('PRAGMA user_version = 2')
@@ -609,9 +620,10 @@ def test_a_migrated_prepared_step_without_an_identity_cannot_be_authorized(db_pa
 
         assert 'DISPATCH_PREPARED' in excinfo.value.reason
         assert dump(db_path) == before
-    assert raw(db_path, 'PRAGMA user_version') == [(4,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(5,)]
     assert raw(db_path, 'SELECT COUNT(*) FROM step_dispatches') == [(0,)]
     assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_contexts') == [(0,)]
+    assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_authorizations') == [(0,)]
 
 
 # Direct entry to DISPATCHED
@@ -1238,11 +1250,11 @@ def test_importing_the_store_loads_no_ros_network_or_llm_package():
     assert child.stdout.strip() == '[]'
 
 
-def test_the_schema_is_version_4_with_exactly_the_expected_tables_and_columns(db_path):
+def test_the_schema_is_version_5_with_exactly_the_expected_tables_and_columns(db_path):
     MissionStore(db_path).close()
 
-    assert storage.SCHEMA_VERSION == 4
-    assert raw(db_path, 'PRAGMA user_version') == [(4,)]
+    assert storage.SCHEMA_VERSION == 5
+    assert raw(db_path, 'PRAGMA user_version') == [(5,)]
     tables = {name for (name,) in raw(
         db_path, "SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert tables == set(COLUMNS)

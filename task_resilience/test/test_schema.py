@@ -83,10 +83,13 @@ def check_list(conn, table, column):
     return re.findall(r"'([^']*)'", match.group(1))
 
 
-def test_fresh_database_is_created_at_version_4(conn):
-    assert conn.execute('PRAGMA user_version').fetchone()[0] == 4
+def test_fresh_database_is_created_at_version_5(conn):
+    assert conn.execute('PRAGMA user_version').fetchone()[0] == 5
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert tables == {'missions', 'mission_steps', 'step_dispatches', 'dispatch_contexts'}
+    assert tables == {
+        'missions', 'mission_steps', 'step_dispatches', 'dispatch_contexts',
+        'dispatch_authorizations',
+    }
 
 
 def test_missions_table_gains_only_mission_state(conn):
@@ -100,6 +103,10 @@ def test_step_dispatches_table_holds_only_the_identity(conn):
     assert columns(conn, 'step_dispatches') == [
         'dispatch_id', 'mission_id', 'step_key', 'created_at',
     ]
+
+
+def test_dispatch_authorizations_table_holds_only_the_dispatch_and_its_time(conn):
+    assert columns(conn, 'dispatch_authorizations') == ['dispatch_id', 'authorized_at']
 
 
 def test_mission_steps_table_holds_only_identity_order_and_state(conn):

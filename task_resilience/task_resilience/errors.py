@@ -231,3 +231,30 @@ class CorruptDispatchContext(Exception):
         self.step_key = step_key
         self.reason = reason
         self.value = value
+
+
+class DispatchAuthorizationMissing(Exception):
+    """A dispatch exists, but the store holds no durable record that its send was authorized."""
+
+    # This is a lack of proof, not proof that no authorization happened: a dispatch that was
+    # authorized before schema version 5 has no record either.
+    def __init__(self, mission_id: str, step_key: str) -> None:
+        super().__init__(
+            f'dispatch of step {step_key!r} of mission {mission_id!r} has no durable '
+            'send authorization record')
+        self.mission_id = mission_id
+        self.step_key = step_key
+
+
+class CorruptDispatchAuthorization(Exception):
+    """A dispatch's stored send authorization is malformed or contradicts its step's state."""
+
+    def __init__(
+        self, mission_id: str, step_key: str, reason: str, value: object = None,
+    ) -> None:
+        super().__init__(
+            f'send authorization of step {step_key!r} of mission {mission_id!r}: {reason}')
+        self.mission_id = mission_id
+        self.step_key = step_key
+        self.reason = reason
+        self.value = value

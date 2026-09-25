@@ -148,7 +148,7 @@ def test_version_1_database_migrates_when_opened(db_path):
 
     MissionStore(db_path).close()
 
-    assert raw(db_path, 'PRAGMA user_version') == [(4,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(5,)]
     assert v1_snapshot(db_path) == before
 
 
@@ -190,7 +190,7 @@ def test_empty_version_1_database_migrates(db_path):
 
     MissionStore(db_path).close()
 
-    assert raw(db_path, 'PRAGMA user_version') == [(4,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(5,)]
     assert raw(db_path, 'SELECT COUNT(*) FROM missions') == [(0,)]
 
 
@@ -291,7 +291,7 @@ def test_concurrent_opens_of_a_version_1_database_migrate_it_once(db_path):
         for future in [pool.submit(open_and_close) for _ in range(workers)]:
             future.result(timeout=10)
 
-    assert raw(db_path, 'PRAGMA user_version') == [(4,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(5,)]
     assert v1_snapshot(db_path) == before
     assert raw(db_path, 'SELECT DISTINCT mission_state FROM missions') == [('ACCEPTED',)]
 
@@ -305,7 +305,8 @@ def test_concurrent_opens_of_a_version_1_database_migrate_it_once(db_path):
     '_DROP_V1_MISSIONS',     # after the rows were copied
     '_MISSION_STEPS_DDL',    # after the old table was dropped
     '_STEP_DISPATCHES_DDL',  # after all of version 2 exists: the last step to version 3
-    '_DISPATCH_CONTEXTS_DDL',  # after all of version 3 exists: the last step to version 4
+    '_DISPATCH_CONTEXTS_DDL',  # after all of version 3 exists: the step to version 4
+    '_DISPATCH_AUTHORIZATIONS_DDL',  # after all of version 4 exists: the last step to version 5
 ])
 def test_migration_failing_partway_leaves_the_version_1_database_intact(
         db_path, monkeypatch, statement):
@@ -324,7 +325,7 @@ def test_migration_failing_partway_leaves_the_version_1_database_intact(
     # A later, healthy open picks the migration up again.
     with MissionStore(db_path) as store:
         assert store.get_by_mission_id(LEGACY[0]['mission_id']).state is MissionState.ACCEPTED
-    assert raw(db_path, 'PRAGMA user_version') == [(4,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(5,)]
 
 
 class FailingCommit:
@@ -351,7 +352,7 @@ def test_failed_commit_cannot_leave_a_new_version_with_a_partial_schema(db_path,
     real_connect = sqlite3.connect
 
     with monkeypatch.context() as patch:
-        # Every statement, including PRAGMA user_version = 4, has run by now.
+        # Every statement, including PRAGMA user_version = 5, has run by now.
         patch.setattr(
             storage.sqlite3, 'connect', lambda *a, **kw: FailingCommit(real_connect(*a, **kw)))
         with pytest.raises(sqlite3.OperationalError, match='injected commit failure'):
@@ -364,7 +365,7 @@ def test_failed_commit_cannot_leave_a_new_version_with_a_partial_schema(db_path,
 
     with MissionStore(db_path):
         pass
-    assert raw(db_path, 'PRAGMA user_version') == [(4,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(5,)]
 
 
 # Version 2 databases
@@ -503,16 +504,17 @@ def assert_still_version_2(path, expected_snapshot, expected_schema):
     assert schema_of(path) == expected_schema
 
 
-def test_version_2_database_migrates_to_version_4_when_opened(db_path):
+def test_version_2_database_migrates_to_version_5_when_opened(db_path):
     make_v2_database(db_path)
     before = v2_snapshot(db_path)
 
     MissionStore(db_path).close()
 
-    assert raw(db_path, 'PRAGMA user_version') == [(4,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(5,)]
     assert v2_snapshot(db_path) == before
     assert table_names(db_path) == {
-        'missions', 'mission_steps', 'step_dispatches', 'dispatch_contexts'}
+        'missions', 'mission_steps', 'step_dispatches', 'dispatch_contexts',
+        'dispatch_authorizations'}
 
 
 def test_migrated_version_2_states_and_attempts_are_unchanged(db_path):
@@ -711,7 +713,7 @@ def test_concurrent_opens_of_a_version_2_database_migrate_it_once(db_path):
         for future in [pool.submit(open_and_close) for _ in range(workers)]:
             future.result(timeout=10)
 
-    assert raw(db_path, 'PRAGMA user_version') == [(4,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(5,)]
     assert v2_snapshot(db_path) == before
 
 
@@ -728,7 +730,7 @@ def test_a_failed_version_2_migration_leaves_the_database_at_version_2(db_path, 
     assert_still_version_2(db_path, before, schema)
     with MissionStore(db_path):
         pass
-    assert raw(db_path, 'PRAGMA user_version') == [(4,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(5,)]
 
 
 def test_a_failed_commit_leaves_a_version_2_database_at_version_2(db_path, monkeypatch):
@@ -758,14 +760,17 @@ def test_a_version_1_open_is_one_transaction_and_never_commits_an_intermediate_v
     assert statements.count('COMMIT') == 1
     assert 'PRAGMA user_version = 2' not in statements
     assert 'PRAGMA user_version = 3' not in statements
-    assert statements.count('PRAGMA user_version = 4') == 1
+    assert 'PRAGMA user_version = 4' not in statements
+    assert statements.count('PRAGMA user_version = 5') == 1
     # The whole chain, every step, ran before the single commit.
     assert (statements.index('ALTER TABLE missions RENAME TO missions_v1')
             < next(i for i, sql in enumerate(statements)
                    if sql.startswith('CREATE TABLE step_dispatches'))
             < next(i for i, sql in enumerate(statements)
                    if sql.startswith('CREATE TABLE dispatch_contexts'))
-            < statements.index('PRAGMA user_version = 4')
+            < next(i for i, sql in enumerate(statements)
+                   if sql.startswith('CREATE TABLE dispatch_authorizations'))
+            < statements.index('PRAGMA user_version = 5')
             < statements.index('COMMIT'))
 
 
@@ -776,7 +781,7 @@ def test_a_version_1_migration_failing_at_the_last_step_leaves_version_1_not_an_
     schema = schema_of(db_path)
 
     with monkeypatch.context() as patch:
-        patch.setattr(storage, '_DISPATCH_CONTEXTS_DDL', 'THIS IS NOT SQL')
+        patch.setattr(storage, '_DISPATCH_AUTHORIZATIONS_DDL', 'THIS IS NOT SQL')
         with pytest.raises(sqlite3.OperationalError):
             MissionStore(db_path)
 

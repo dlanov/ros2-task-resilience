@@ -167,6 +167,41 @@ class DispatchContextRecord:
 
 
 @dataclass(frozen=True)
+class DispatchAuthorizationRecord:
+    """
+    Durable provenance, under the supported-store contract, of a committed send authorization.
+
+    Under that contract a valid row is provenance that authorize_step_send committed
+    authorization for this dispatch, and nothing but that operation creates one. It is not
+    tamper-evident: a writer that bypasses MissionStore can forge or alter even a canonically
+    formatted row, and such writes are outside the supported contract.
+
+    That is all it says. It is not proof that send_goal was called, that a request left the
+    process, that anything received or accepted it, or that a result exists, and it is not
+    a permission: no API accepts it. authorized_at is the store's own wall-clock time for
+    the authorization transaction, not a send, server or result time, and it says nothing
+    about whether a server still retains a result. The attempt number is not kept.
+    """
+
+    dispatch_id: uuid.UUID
+    mission_id: str
+    step_key: str
+    authorized_at: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.dispatch_id, uuid.UUID):
+            raise TypeError(f'dispatch_id must be a uuid.UUID, got {self.dispatch_id!r}')
+        if not isinstance(self.mission_id, str) or not isinstance(self.step_key, str):
+            raise TypeError('mission_id and step_key must be strings')
+        if not self.mission_id or not self.step_key:
+            raise ValueError('mission_id and step_key must not be empty')
+        if not isinstance(self.authorized_at, datetime):
+            raise TypeError(f'authorized_at must be a datetime, got {self.authorized_at!r}')
+        if self.authorized_at.utcoffset() != timedelta(0):
+            raise ValueError('authorized_at must be a timezone-aware UTC datetime')
+
+
+@dataclass(frozen=True)
 class SendAuthorization:
     """
     The receipt of a send authorization that has been committed.

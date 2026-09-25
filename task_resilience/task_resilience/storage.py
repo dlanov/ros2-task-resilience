@@ -14,7 +14,7 @@
 
 from collections.abc import Iterable, Iterator
 import contextlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import enum
 import json
 import os
@@ -24,9 +24,11 @@ import uuid
 
 from .errors import (
     AttemptLimitReached,
+    CorruptDispatchAuthorization,
     CorruptDispatchContext,
     CorruptDispatchRecord,
     CorruptStoredState,
+    DispatchAuthorizationMissing,
     DispatchContextConflict,
     DispatchContextMissing,
     DispatchNotFound,
@@ -42,6 +44,7 @@ from .errors import (
     UnsupportedSchemaVersion,
 )
 from .model import (
+    DispatchAuthorizationRecord,
     DispatchContextRecord,
     DispatchRecord,
     MissionRecord,
@@ -53,7 +56,7 @@ from .model import (
 from .reconciliation import ExpectedActionContext
 from .state_machine import MissionState, StepState, transition_mission, transition_step
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _State = TypeVar('_State', bound=enum.Enum)
 
@@ -139,6 +142,24 @@ CREATE TABLE dispatch_contexts (
 )
 """
 
+# One row per dispatch for which authorize_step_send committed a send authorization. Under the
+# supported-store contract the row is written in that transaction and by nothing else, so a valid
+# row is durable provenance that the authorization committed, not that a request was sent. The
+# absence of a row is a lack of proof, not proof that no authorization happened: a dispatch
+# authorized before this table existed has none. The primary key allows one row per dispatch. It
+# does not make a row immutable: only authorize_step_send inserts one, and no code updates or
+# deletes one. The table is not tamper-evident: nothing stops a writer that bypasses the code
+# from forging or altering even a canonically formatted row, and such writes are outside the
+# contract. authorized_at is the store's own wall-clock time for that transaction. The attempt
+# number is deliberately not kept.
+_DISPATCH_AUTHORIZATIONS_DDL = """
+CREATE TABLE dispatch_authorizations (
+    dispatch_id   TEXT NOT NULL PRIMARY KEY
+                  REFERENCES step_dispatches (dispatch_id) ON DELETE CASCADE,
+    authorized_at TEXT NOT NULL
+)
+"""
+
 _RENAME_V1_MISSIONS = 'ALTER TABLE missions RENAME TO missions_v1'
 
 _COPY_V1_MISSIONS = """
@@ -209,6 +230,14 @@ VALUES (?, ?, ?, ?)
 """
 
 _CONTEXT_FIELDS = ('action_name', 'action_type', 'robot_namespace')
+
+_AUTHORIZATION_OF_DISPATCH = 'SELECT * FROM dispatch_authorizations WHERE dispatch_id = ?'
+
+# The only statement that writes dispatch_authorizations, and only authorize_step_send runs it.
+_INSERT_AUTHORIZATION = """
+INSERT INTO dispatch_authorizations (dispatch_id, authorized_at)
+VALUES (?, ?)
+"""
 
 
 def _utc_now() -> str:
@@ -291,6 +320,32 @@ def _to_context(row: sqlite3.Row, dispatch: DispatchRecord) -> DispatchContextRe
         action_name=row['action_name'],
         action_type=row['action_type'],
         robot_namespace=row['robot_namespace'],
+    )
+
+
+def _to_authorization(
+    row: sqlite3.Row, dispatch: DispatchRecord,
+) -> DispatchAuthorizationRecord:
+    # Only the exact text _utc_now writes is accepted, like the canonical UUID in _to_dispatch:
+    # anything else means the row was changed behind our back. The value is never compared with
+    # another timestamp, because a wall clock can step backwards.
+    stored = row['authorized_at']
+    parsed = None
+    if isinstance(stored, str):
+        try:
+            parsed = datetime.fromisoformat(stored)
+        except ValueError:
+            pass
+    if (parsed is None or parsed.utcoffset() != timedelta(0)
+            or parsed.isoformat(timespec='microseconds') != stored):
+        raise CorruptDispatchAuthorization(
+            dispatch.mission_id, dispatch.step_key,
+            'authorized_at is not a canonical UTC timestamp', stored)
+    return DispatchAuthorizationRecord(
+        dispatch_id=dispatch.dispatch_id,
+        mission_id=dispatch.mission_id,
+        step_key=dispatch.step_key,
+        authorized_at=parsed,
     )
 
 
@@ -479,13 +534,13 @@ class MissionStore:
         """
         Authorize the one send of a prepared step, consuming one attempt for it.
 
-        The step's dispatch must also have a bound action context. The checks and both
-        writes are a single transaction, and the receipt is returned
-        only once it has committed. Nothing external happens in here: the caller sends
-        afterwards, and only a caller that got a receipt may. A replay is refused and is
-        never answered with the earlier receipt. A committed authorization is not undone,
-        so a crash after the commit can mean no send at all, but never a second
-        authorization.
+        The step's dispatch must also have a bound action context. The checks and all three
+        writes, the attempt, the durable authorization record and DISPATCHED, are a single
+        transaction, and the receipt is returned only once it has committed. Nothing external
+        happens in here: the caller sends afterwards, and only a caller that got a receipt
+        may. A replay is refused and is never answered with the earlier receipt. A committed
+        authorization is not undone, so a crash after the commit can mean no send at all, but
+        never a second authorization.
         """
         with self._transaction():
             mission = self._require(_BY_MISSION_ID, mission_id)
@@ -513,22 +568,34 @@ class MissionStore:
             # authorized. Like the checks above, this comes before anything is written.
             self._require_context(dispatch)
 
+            # A step that is still DISPATCH_PREPARED cannot already have an authorization
+            # record. If it does, the row is not ours and not a receipt to hand back: it is
+            # corruption, so it is neither replaced nor deleted and no attempt is consumed.
+            self._authorization_of(step, dispatch)
+
             # The state machine still decides that this edge exists.
             new_state = transition_step(step.state, StepState.DISPATCHED)
             now = _utc_now()
             if not self._conn.execute(_CONSUME, (now, mission_id)).rowcount:
                 raise AttemptLimitReached(mission_id, mission.max_attempts)
+            # The attempt, this record and DISPATCHED are one atomic fact, all with the one
+            # timestamp. The record says an authorization was committed, not that anything
+            # was sent. It is the only place a record is inserted, and the step is written
+            # last.
+            self._conn.execute(_INSERT_AUTHORIZATION, (str(dispatch.dispatch_id), now))
             self._conn.execute(_SET_STEP_STATE, (new_state.value, now, mission_id, step_key))
 
             # Built here, but the caller gets it only when this block ends: if COMMIT
-            # fails, the caller gets that error and no receipt.
+            # fails, the caller gets that error and no receipt. The time is the persisted
+            # value read back, not a second reading of the clock.
+            authorization = self._require_authorization(dispatch)
             return SendAuthorization(
                 mission_id=mission_id,
                 step_key=step_key,
                 dispatch_id=dispatch.dispatch_id,
                 attempt_number=mission.attempts_used + 1,
                 max_attempts=mission.max_attempts,
-                authorized_at=datetime.fromisoformat(now),
+                authorized_at=authorization.authorized_at,
             )
 
     def get_step_dispatch(self, mission_id: str, step_key: str) -> DispatchRecord:
@@ -547,6 +614,43 @@ class MissionStore:
         """Return the action context bound to the step's dispatch. Never binds or repairs one."""
         self._require_step(mission_id, step_key)
         return self._require_context(self._require_dispatch(mission_id, step_key))
+
+    def get_dispatch_authorization(
+        self, mission_id: str, step_key: str,
+    ) -> DispatchAuthorizationRecord:
+        """
+        Return the durable record that authorize_step_send committed a send authorization.
+
+        Under the supported-store contract a valid record is provenance of that commit. It is
+        not tamper-evident: a writer that bypasses MissionStore can forge or alter even a
+        canonically formatted row. Never creates, repairs or backfills one, and executes no
+        write. A record is not proof
+        that anything was sent. No record is not proof that no authorization happened: a step
+        that progressed past DISPATCH_PREPARED under schema version 4 has none, and that raises
+        DispatchAuthorizationMissing, not corruption. A DISPATCH_PREPARED step that has one
+        raises CorruptDispatchAuthorization.
+        """
+        # One read transaction: the step's state and the record are compared, and a
+        # concurrent authorization between the reads would make them contradict each other.
+        with self._snapshot():
+            step = self._require_step(mission_id, step_key)
+            dispatch = self._require_dispatch(mission_id, step_key)
+            authorization = self._authorization_of(step, dispatch)
+            if authorization is None:
+                raise DispatchAuthorizationMissing(mission_id, step_key)
+            return authorization
+
+    @contextlib.contextmanager
+    def _snapshot(self) -> Iterator[None]:
+        # A deferred transaction for reads that must agree with each other. The first read
+        # takes a shared lock that is held to the end, so a writer cannot commit in between.
+        # Nothing is written, so it ends with ROLLBACK, which only releases the lock.
+        self._conn.execute('BEGIN')
+        try:
+            yield
+        finally:
+            if self._conn.in_transaction:
+                self._conn.execute('ROLLBACK')
 
     @contextlib.contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -577,14 +681,17 @@ class MissionStore:
                 self._conn.execute(_MISSION_STEPS_DDL)
                 self._conn.execute(_STEP_DISPATCHES_DDL)
                 self._conn.execute(_DISPATCH_CONTEXTS_DDL)
-            elif version in (1, 2, 3):
+                self._conn.execute(_DISPATCH_AUTHORIZATIONS_DDL)
+            elif version in (1, 2, 3, 4):
                 # An older database goes through every step up to the current version inside
                 # this one transaction, so no version in between is ever committed.
                 if version == 1:
                     self._migrate_v1_to_v2()
                 if version <= 2:
                     self._migrate_v2_to_v3()
-                self._migrate_v3_to_v4()
+                if version <= 3:
+                    self._migrate_v3_to_v4()
+                self._migrate_v4_to_v5()
             else:
                 raise UnsupportedSchemaVersion(version)
             self._conn.execute(f'PRAGMA user_version = {SCHEMA_VERSION}')
@@ -609,6 +716,12 @@ class MissionStore:
         # Only a table is added. Existing dispatches get no context: none was declared,
         # and an action name, type or namespace would be invented.
         self._conn.execute(_DISPATCH_CONTEXTS_DDL)
+
+    def _migrate_v4_to_v5(self) -> None:
+        # Only a table is added. Existing dispatches get no record, however far they have
+        # progressed: whether an authorization was committed under version 4 cannot be told
+        # from DISPATCHED, the attempt counter or a timestamp, so none is invented.
+        self._conn.execute(_DISPATCH_AUTHORIZATIONS_DDL)
 
     def _fetch(self, query: str, value: str) -> MissionRecord | None:
         row = self._conn.execute(query, (value,)).fetchone()
@@ -658,6 +771,39 @@ class MissionStore:
         if context is None:
             raise DispatchContextMissing(dispatch.mission_id, dispatch.step_key)
         return context
+
+    def _fetch_authorization(self, dispatch: DispatchRecord) -> DispatchAuthorizationRecord | None:
+        row = self._conn.execute(
+            _AUTHORIZATION_OF_DISPATCH, (str(dispatch.dispatch_id),)).fetchone()
+        return None if row is None else _to_authorization(row, dispatch)
+
+    def _require_authorization(self, dispatch: DispatchRecord) -> DispatchAuthorizationRecord:
+        authorization = self._fetch_authorization(dispatch)
+        if authorization is None:
+            raise DispatchAuthorizationMissing(dispatch.mission_id, dispatch.step_key)
+        return authorization
+
+    def _authorization_of(
+        self, step: StepRecord, dispatch: DispatchRecord,
+    ) -> DispatchAuthorizationRecord | None:
+        # The one judgement of a dispatch's authorization record against its step, shared by
+        # the reader and by authorize_step_send. Reads only: no path here writes a record, and
+        # a missing one is never guessed to mean anything.
+        if step.state is StepState.PENDING:
+            # A step that was never prepared has no dispatch. That is reported as the
+            # dispatch record's corruption, not hidden behind the authorization.
+            raise CorruptDispatchRecord(
+                step.mission_id, step.step_key, f'step is {step.state.value} but already has a '
+                'dispatch', str(dispatch.dispatch_id))
+        authorization = self._fetch_authorization(dispatch)
+        if authorization is not None and step.state is StepState.DISPATCH_PREPARED:
+            raise CorruptDispatchAuthorization(
+                step.mission_id, step.step_key,
+                f'step is {step.state.value} but its dispatch already has an authorization',
+                authorization.authorized_at.isoformat(timespec='microseconds'))
+        # Past DISPATCH_PREPARED a record is possible and its absence is not corruption: a
+        # step that was authorized under schema version 4 has none.
+        return authorization
 
     def _require_matching_context(
         self, dispatch: DispatchRecord, action: ExpectedActionContext,

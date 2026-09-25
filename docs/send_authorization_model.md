@@ -8,7 +8,9 @@ lets a caller send a prepared step's request externally. Code:
 
 Task 008 itself changed no schema: version 3 stayed as it was, with no migration, column or table.
 Task 009 later moved the schema to version 4 and added one precondition to this operation, the
-bound action context (see "The operation" and `docs/dispatch_context_model.md`).
+bound action context (see "The operation" and `docs/dispatch_context_model.md`). Task 010 then moved
+it to version 5 and made the operation also commit a durable per-dispatch record that the
+authorization was committed (see "The operation" and `docs/dispatch_authorization_model.md`).
 
 ## The attempt
 
@@ -36,7 +38,7 @@ include that inherited consumption: a mission that had used 2 attempts before th
 | State | Means |
 |---|---|
 | `DISPATCH_PREPARED` | A dispatch UUID was durably reserved, and since Task 009 the action context it is declared to reach is bound with it (a step prepared under version 3 has none, and none is added later; see `docs/dispatch_context_model.md`). No send authorization has been committed. The supported execution path must not send yet. |
-| `DISPATCHED` | A send authorization was **durably committed**. The external request may or may not actually have been sent or received. |
+| `DISPATCHED` | A send authorization was **durably committed**. The external request may or may not actually have been sent or received. Since Task 010 the same transaction also wrote the dispatch's authorization record (a step authorized under version 4 has none; see `docs/dispatch_authorization_model.md`). |
 
 This is a rule for the supported path, not something the state can prove. Nothing in the schema
 or the code stops a caller that sends without asking, or an older or bypassing writer (see
@@ -59,7 +61,7 @@ class SendAuthorization:
     dispatch_id: uuid.UUID     # the goal UUID the caller must use
     attempt_number: int        # the mission's attempts_used after this authorization; see "The attempt"
     max_attempts: int
-    authorized_at: datetime    # timezone-aware UTC; the value written to both rows
+    authorized_at: datetime    # timezone-aware UTC; the value written to both rows and the record
 ```
 
 The whole sequence is one `BEGIN IMMEDIATE` transaction. The checks come in this order, and
@@ -75,10 +77,12 @@ the first that fails raises without having written anything:
 | 6 | no step of the mission is `OUTCOME_UNKNOWN` | `MissionReconciliationRequired(mission_id, step_keys)` |
 | 7 | the step has exactly one dispatch row with a canonical UUID | `CorruptDispatchRecord` |
 | 8 | the dispatch has a valid bound action context (added by Task 009) | `DispatchContextMissing`, `CorruptDispatchContext` |
-| 9 | the state machine still allows `DISPATCH_PREPARED` to `DISPATCHED` | `InvalidStateTransition` |
-| 10 | an attempt remains, and one is taken | `AttemptLimitReached` |
-| 11 | the step is moved to `DISPATCHED` | |
-| 12 | the receipt is returned, only after the transaction commits | |
+| 9 | the dispatch has no authorization record yet (added by Task 010) | `CorruptDispatchAuthorization` |
+| 10 | the state machine still allows `DISPATCH_PREPARED` to `DISPATCHED` | `InvalidStateTransition` |
+| 11 | an attempt remains, and one is taken | `AttemptLimitReached` |
+| 12 | the authorization record is inserted (added by Task 010) | |
+| 13 | the step is moved to `DISPATCHED` | |
+| 14 | the receipt is returned, only after the transaction commits | |
 
 Check 8 is the only change Task 009 makes to this operation. It comes before anything is written,
 so a refusal takes no attempt and changes no cell. The order of every other check is as before,
@@ -88,9 +92,16 @@ Nothing binds a context afterwards, so a prepared step that has none, whether it
 version 3 or its context was removed outside the supported code, cannot be authorized. It fails
 closed with `DispatchContextMissing` and the store does not try to tell the two apart.
 
-The writes are exactly two updates, with one shared timestamp: on the mission row,
-`attempts_used` and `updated_at`; on the step row, `step_state` and `updated_at`. The dispatch
-row, every `created_at`, and every other step are untouched.
+Check 9 and the insert at step 12 are Task 010's. A step that is `DISPATCH_PREPARED` cannot already
+have an authorization record, so one that does is corruption: it is not answered with an earlier
+receipt, is not deleted or replaced, and takes no attempt. The check comes after the context and
+before the state machine and the budget, so nothing else changes its place or its error.
+
+The writes are exactly three, in this order and with one shared timestamp: on the mission row,
+`attempts_used` and `updated_at`; one new row in `dispatch_authorizations`, holding the dispatch
+ID and that timestamp; on the step row, `step_state` and `updated_at`. The dispatch row, its
+context, every `created_at`, and every other step are untouched. The receipt's `authorized_at` is
+the stored value, read back inside the transaction, not a second reading of the clock.
 
 The limit check is the same atomic `UPDATE ... WHERE attempts_used < max_attempts` the counter
 always had, so the limit holds even if the checks above are ever reordered.
@@ -101,7 +112,9 @@ A replay is never answered with the earlier receipt. A step that is not `DISPATC
 authorizing again would be a second send.
 
 The receipt is a record of a committed fact. It is not persisted, no API accepts it, and building
-one gives no permission. It is not a token, a lease or a capability.
+one gives no permission. It is not a token, a lease or a capability. What is persisted, since
+Task 010, is the separate authorization record of the dispatch. It is not a receipt: this operation
+does not return it, and no API accepts it either.
 
 ## At most one successful return
 
@@ -127,11 +140,11 @@ try to authorize again.
 | Where the process dies | Durable facts after reopening | Another authorization? |
 |---|---|---|
 | Before the transaction | unchanged | yes: nobody held permission |
-| After the attempt update, before the step update | rolled back: `DISPATCH_PREPARED`, attempts unchanged | yes |
-| After both updates, before `COMMIT` (exit and SIGKILL) | rolled back | yes |
-| **After `COMMIT`, before the return** (exit and SIGKILL) | `DISPATCHED`, attempt consumed | **no** |
-| After the return, before any send | `DISPATCHED`, attempt consumed | **no** |
-| After the send, before any result is stored | `DISPATCHED`, attempt consumed | **no** |
+| After the attempt update, or after the record insert, before the step update | rolled back: `DISPATCH_PREPARED`, attempts unchanged, no record | yes |
+| After all three writes, before `COMMIT` (exit and SIGKILL) | rolled back | yes |
+| **After `COMMIT`, before the return** (exit and SIGKILL) | `DISPATCHED`, attempt consumed, record written | **no** |
+| After the return, before any send | `DISPATCHED`, attempt consumed, record written | **no** |
+| After the send, before any result is stored | `DISPATCHED`, attempt consumed, record written | **no** |
 
 The last three rows leave identical durable facts. That is the point of the meaning of
 `DISPATCHED`.
@@ -234,8 +247,10 @@ request means and its fingerprint, and it is outside this task.
 ## Schema
 
 Task 008 stored nothing new, and version 3 was unchanged by it. Task 009 has since moved the schema
-to version 4 with one table for the dispatch's action context (`docs/dispatch_context_model.md`).
-None of the reasoning below depends on it. What Task 008's design rests on:
+to version 4 with one table for the dispatch's action context (`docs/dispatch_context_model.md`),
+and Task 010 to version 5 with one table for the authorization record
+(`docs/dispatch_authorization_model.md`). None of the reasoning below depends on either. What Task
+008's design rests on:
 
 - one authorization per dispatch comes from the step state, which only moves forward, and from
   the single transaction;
@@ -245,9 +260,13 @@ None of the reasoning below depends on it. What Task 008's design rests on:
 
 What the schema cannot express for this operation, none of it needed for the guarantee above:
 
-- the authorization time is not kept: `updated_at` is overwritten by later transitions;
+- Task 008 did not keep the authorization time: `updated_at` is overwritten by later transitions.
+  Since Task 010 it is kept, in the authorization record, for each dispatch that version 5 code
+  authorized. A dispatch authorized earlier has no record, and none is made up;
 - an attempt cannot be attributed to a step from step states alone, because `FAILED`, `CANCELLED`
-  and `OUTCOME_UNKNOWN` can be reached with or without an authorization;
+  and `OUTCOME_UNKNOWN` can be reached with or without an authorization. Since Task 010 the
+  authorization record says whether supported code committed one for a dispatch, but not which
+  attempt number it was, and it is absent for a dispatch authorized before version 5;
 - a step cannot have more than one dispatch;
 - the database does not stop a writer that ignores this API, such as an older build.
 
@@ -268,5 +287,5 @@ a caller should call it. It never does.
 ## Not decided here
 
 Retry policy; step ordering; who moves a step stuck at `DISPATCHED` to a reconciled state; a
-protocol for cancelling an authorized step; persisting the authorization time; leases, fencing and
-single-supervisor exclusion; the ROS adapter that actually sends.
+protocol for cancelling an authorized step; leases, fencing and single-supervisor exclusion; the
+ROS adapter that actually sends.

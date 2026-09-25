@@ -3,8 +3,8 @@
 > **Working title:** ROS 2 Task Resilience
 > **Working repository name:** `ros2-task-resilience`
 > **Initial ROS packages:** `task_resilience_msgs`, `task_resilience`, `task_resilience_demos`
-> **Status:** Phase 1 (durable mission core) in progress. The ROS-independent core, the Task 006 recovery spike and the Task 007 reconciliation decision model are committed; Task 008 (send authorization and attempt semantics) is complete; Task 009 (the durable action context of a dispatch, schema version 4) is complete.
-> **Last updated:** 2026-09-24
+> **Status:** Phase 1 (durable mission core) in progress. The ROS-independent core, the Task 006 recovery spike and the Task 007 reconciliation decision model are committed; Task 008 (send authorization and attempt semantics) is complete; Task 009 (the durable action context of a dispatch, schema version 4) is complete; Task 010 (the durable send-authorization provenance of a dispatch, schema version 5) is complete.
+> **Last updated:** 2026-09-25
 > **Primary maintainer:** Dennis Lanov
 
 ## 1. Project purpose
@@ -387,14 +387,15 @@ The first interface set should remain minimal. Do not create messages merely bec
 
 SQLite is the initial persistence mechanism.
 
-### Implemented so far (schema version 4)
+### Implemented so far (schema version 5)
 
-The schema version is `PRAGMA user_version`. A version 1, 2 or 3 database migrates to version 4 when it is opened, in one transaction.
+The schema version is `PRAGMA user_version`. A version 1, 2, 3 or 4 database migrates to version 5 when it is opened, in one transaction.
 
 - `missions`: mission ID, external request ID, request fingerprint and canonical payload, attempt limit and attempts used, `mission_state`, and created/updated timestamps.
 - `mission_steps`: mission ID, caller-supplied stable `step_key`, `step_index` (order), `step_state`, and created/updated timestamps. Nothing else is stored per step yet.
 - `step_dispatches`: the durable dispatch UUID of a step, with the mission ID, step key and creation time. At most one per step. A step that was never prepared through the store has none.
 - `dispatch_contexts`: the action a dispatch is declared to reach, keyed by its dispatch UUID: `action_name`, `action_type` and `robot_namespace`, exact strings. At most one per dispatch. A dispatch that predates version 4 has none, and none is made up.
+- `dispatch_authorizations`: one row per dispatch for which `authorize_step_send` committed a send authorization, keyed by its dispatch UUID, with `authorized_at`. Under the supported-store contract only that operation writes one, and the table is not tamper-evident. Nothing else is stored in it: no attempt number, no evidence. A dispatch authorized before version 5 has none, and none is made up.
 
 Every state change is validated by the state model (section 13) inside a write transaction.
 
@@ -427,13 +428,27 @@ Task 009. Full description: `docs/dispatch_context_model.md`.
 - There is **no late binding and no backfill**. A missing context is ambiguous: it may be a dispatch prepared under version 3 that never had one, or a version 4 dispatch whose context was removed outside the supported code, and version 4 stores nothing that tells them apart. Supported code therefore fails closed. For a `DISPATCH_PREPARED` step with a UUID and no context, `get_dispatch_context`, `authorize_step_send` and a `prepare_step_dispatch(..., action)` replay all raise `DispatchContextMissing`, consume no attempt, and change no row, state or timestamp. A step that was `PENDING` when migrated gets a UUID and a context together when it is first prepared.
 - Every migrated dispatch that predates a context, whatever its state, stays unbound and is unavailable to a future evidence-backed reconciliation until some separately reviewed mechanism exists. An explicit legacy or operator-attestation mechanism could be designed later if it is needed. It is not designed or implemented.
 - Correlating a result to an action is a different problem from proving the correct goal body was sent. No goal body or goal hash is stored, and that is deferred until the project has a durable per-step goal specification.
-- Task 009 stores the declared context and nothing more. Recording recovery evidence and applying a reconciliation outcome are Task 010.
+- Task 009 stores the declared context and nothing more. Recording recovery evidence and applying a reconciliation outcome are Task 011.
+
+### Dispatch authorization record
+
+Task 010. Full description: `docs/dispatch_authorization_model.md`.
+
+- Within the supported `MissionStore` API, a row is created only by `authorize_step_send`, when that authorization commits, in the same transaction as the attempt it took and `DISPATCHED`. Under the supported-store contract, a valid row is durable provenance that `authorize_step_send` committed authorization for this dispatch. It does not mean `send_goal` was called, that a request left the process, that anything received or accepted it, or that a result exists, and it is not a permission: no API accepts it. The zero-send window stays valid.
+- The table is **not tamper-evident**. A writer that bypasses `MissionStore` can forge or alter even a canonically formatted row; such writes are outside the supported contract, the schema cannot prevent them, and no signature, MAC, hash, permission or ownership field is added. Task 011 may rely on the row under this same trusted-store assumption.
+- `authorized_at` is the store's own wall-clock UTC time for that transaction, the same text as `missions.updated_at`, `mission_steps.updated_at` and `SendAuthorization.authorized_at`. It is not a send, server or result time, it is not proof that a result is retained or has expired, and it must never be used to reason about server retention or to authorize a retry.
+- The attempt number is deliberately not stored, and must not be reconstructed from row order, a count of rows or `authorized_at`.
+- The primary key gives one row per dispatch. It does not make the row physically immutable. Only `authorize_step_send` inserts one, and production code never updates or deletes one. A stored time must be exactly the canonical UTC text the store writes, or the row is `CorruptDispatchAuthorization`.
+- `get_dispatch_authorization(mission_id, step_key)` reads it and writes nothing. A `DISPATCH_PREPARED` step that already has a row is corruption. For a step that has progressed, no row is `DispatchAuthorizationMissing`, not corruption: it means this store has no durable proof, **not** that no authorization was committed.
+- Migration to version 5 is a pure `CREATE TABLE` that creates zero rows. It never infers an old authorization from `DISPATCHED`, `attempts_used` or a timestamp. A prepared step that version 4 wrote is authorized normally under version 5, taking an attempt and writing its row then.
+- `OUTCOME_UNKNOWN` with a row means, under the supported-store contract, that `authorize_step_send` committed an authorization for the dispatch before the later lifecycle. `OUTCOME_UNKNOWN` with no row means version 5 has no durable proof. Task 010 does not decide what either means for recovery, and the state machine is unchanged.
+- No evidence is stored. Terminal recovery evidence, and applying it to a step's state, are Task 011.
 
 ### Send authorization and attempts
 
 **One attempt is one committed authorization to send one external step request.** The counter (`attempts_used` against `max_attempts`) is mission-wide, and preparation consumes none.
 
-`MissionStore.authorize_step_send(mission_id, step_key)` is the only operation that increases `attempts_used`, and the only one that enters `DISPATCHED`. In one write transaction it checks that the mission is `RUNNING`, that the step is exactly `DISPATCH_PREPARED`, that no step of the mission is `OUTCOME_UNKNOWN`, that the step's dispatch UUID exists and is valid, that the dispatch has a valid bound action context, and that an attempt remains. It then takes one attempt and moves the step to `DISPATCHED`, with one UTC timestamp for both rows. It returns a `SendAuthorization` receipt only after the commit. Nothing external happens inside the transaction. The public `consume_attempt` was removed, and a plain state transition into `DISPATCHED` raises `SendAuthorizationRequired`. See `docs/send_authorization_model.md`.
+`MissionStore.authorize_step_send(mission_id, step_key)` is the only operation that increases `attempts_used`, and the only one that enters `DISPATCHED`. In one write transaction it checks that the mission is `RUNNING`, that the step is exactly `DISPATCH_PREPARED`, that no step of the mission is `OUTCOME_UNKNOWN`, that the step's dispatch UUID exists and is valid, that the dispatch has a valid bound action context, and that an attempt remains. It also checks that the dispatch has no authorization record yet. It then takes one attempt, writes the dispatch's authorization record, and moves the step to `DISPATCHED`, with one UTC timestamp for the mission row, the record and the step row. It returns a `SendAuthorization` receipt only after the commit. Nothing external happens inside the transaction. The public `consume_attempt` was removed, and a plain state transition into `DISPATCHED` raises `SendAuthorizationRequired`. See `docs/send_authorization_model.md`.
 
 - `DISPATCHED` means a send authorization was durably committed. The external request may or may not have been sent or received. It does not mean sent, received, accepted or executing.
 - The guarantee is at most one successful authorization return per prepared dispatch. If the process dies after the commit and before its caller receives the receipt, no later caller gets another one. That can mean no send at all, and never a second authorization.
@@ -712,7 +727,7 @@ general robot autonomy framework
 
 These should be resolved by implementation evidence rather than speculation:
 
-1. Exact mission/action schema. (The persisted mission/step schema is implemented as version 4; the ROS action schema is still open.)
+1. Exact mission/action schema. (The persisted mission/step schema is implemented as version 5; the ROS action schema is still open.)
 2. Exact transaction boundaries around Nav2 dispatch. (The boundary of the send authorization is settled by Task 008; the adapter's send and the recording of its result are not.)
 3. How much downstream ROS action state can be reconciled after different crash timings.
 4. Whether to expose attempt budgets in the public action interface in v0.1.
@@ -737,6 +752,7 @@ Phase 1 (section 16) is the current milestone. It proceeds in bounded tasks:
 - Task 007, reconciliation decision model: **COMPLETE**. A pure decision function (`task_resilience/reconciliation.py`) that says what one recovery observation can establish about a dispatch. It changes no state and never authorizes a send (`docs/reconciliation_decision_model.md`).
 - Task 008, atomic send authorization and attempt semantics: **COMPLETE**. One attempt is one committed authorization to send one external step request, and `MissionStore.authorize_step_send` is the only way to take one and the only way to enter `DISPATCHED`. No schema change (version 3). See `docs/send_authorization_model.md`.
 - Task 009, immutable durable dispatch action context: **COMPLETE**. The action name, type and robot namespace a dispatch is declared to reach are bound to it, together with its UUID and `DISPATCH_PREPARED`, in one transaction (schema version 4, one new table). Declared intent, not proof of where a request was sent. `authorize_step_send` requires a bound context. No evidence is stored and no reconciliation is applied. See `docs/dispatch_context_model.md`.
+- Task 010, durable send-authorization provenance: **COMPLETE**. `authorize_step_send` now commits, in one transaction, the attempt, one row in the new `dispatch_authorizations` table (the dispatch and the store's authorization time) and `DISPATCHED` (schema version 5, one new table). Under the supported-store contract the row means only that `authorize_step_send` committed the authorization (the table is not tamper-evident): not that a request was sent, and not a permission. The attempt number is not stored. Migration creates no row for an earlier dispatch, and no row is not proof that nothing was authorized. No evidence is stored and no reconciliation is applied: terminal recovery evidence and its application are Task 011. See `docs/dispatch_authorization_model.md`.
 
 ### M0: Hardware-Free Nav2 Baseline — COMPLETE
 
