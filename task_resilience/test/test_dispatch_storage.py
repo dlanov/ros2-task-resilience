@@ -79,7 +79,8 @@ MISSION_ROUTE = {
     M.CANCELLING: [M.RUNNING, M.CANCELLING],
     M.CANCELLED: [M.CANCELLED],
     M.FAILED: [M.RUNNING, M.FAILED],
-    M.NEEDS_RECONCILIATION: [M.RUNNING, M.NEEDS_RECONCILIATION],
+    # Reached through enter_mission_reconciliation, once a step is unknown: see the test below.
+    M.NEEDS_RECONCILIATION: [M.RUNNING],
 }
 
 
@@ -521,6 +522,12 @@ def test_preparation_is_not_gated_on_the_mission_state(store, mission_state):
     store.initialize_steps(created.mission_id, KEYS)
     for step in MISSION_ROUTE[mission_state]:
         store.transition_mission_state(created.mission_id, step)
+    if mission_state is M.NEEDS_RECONCILIATION:
+        # The mission enters reconciliation because a step of it is unknown.
+        store.prepare_step_dispatch(created.mission_id, 'return_to_base', ACTION)
+        store.authorize_step_send(created.mission_id, 'return_to_base')
+        store.transition_step_state(created.mission_id, 'return_to_base', S.OUTCOME_UNKNOWN)
+        store.enter_mission_reconciliation(created.mission_id)
     before = store.get_by_mission_id(created.mission_id)
 
     record = store.prepare_step_dispatch(created.mission_id, 'checkpoint_a', ACTION)

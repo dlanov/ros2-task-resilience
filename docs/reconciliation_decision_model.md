@@ -245,8 +245,13 @@ evidence either, and applies no reconciliation state.
 
 Task 011 has since added schema version 6 with one durable table of terminal recovery evidence, and the
 atomic application of a terminal result to a step's state, through this model and gated by that
-provenance. This model is unchanged. Mission-level reconciliation is not done there: it is left to a
-later task, because `NEEDS_RECONCILIATION` still has no exit.
+provenance. This model is unchanged. Mission-level reconciliation is not done by this decision model. Task 012 now provides the dedicated store-level exit, while the pure state machine still has no ordinary exit from `NEEDS_RECONCILIATION`.
+
+Task 012 has since added schema version 7 with the durable state a reconciling mission is to resume, and the
+one dedicated, non-ordinary exit from `NEEDS_RECONCILIATION` (`docs/mission_reconciliation_model.md`). This
+model is unchanged and still calls nothing: that exit reads only persisted step states, never a decision, an
+observation or recovery evidence, and the pure state machine still has no edge out of
+`NEEDS_RECONCILIATION`. The items in the list above are still not done by this model itself.
 
 Also not done: mapping ROS messages onto observations (an adapter), any notion of time, freshness
 or server epoch, and a policy for resolving an `EVIDENCE_CONFLICT`.

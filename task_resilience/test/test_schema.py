@@ -83,12 +83,12 @@ def check_list(conn, table, column):
     return re.findall(r"'([^']*)'", match.group(1))
 
 
-def test_fresh_database_is_created_at_version_6(conn):
-    assert conn.execute('PRAGMA user_version').fetchone()[0] == 6
+def test_fresh_database_is_created_at_version_7(conn):
+    assert conn.execute('PRAGMA user_version').fetchone()[0] == 7
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert tables == {
         'missions', 'mission_steps', 'step_dispatches', 'dispatch_contexts',
-        'dispatch_authorizations', 'recovery_evidence',
+        'dispatch_authorizations', 'recovery_evidence', 'mission_reconciliation_contexts',
     }
 
 
@@ -115,6 +115,13 @@ def test_recovery_evidence_table_has_exactly_the_evidence_columns(conn):
         'result_message_bytes', 'result_message_sha256', 'step_state_before', 'outcome',
         'recorded_at',
     ]
+
+
+def test_mission_reconciliation_contexts_table_holds_only_the_mission_and_the_state_to_resume(
+        conn):
+    assert columns(conn, 'mission_reconciliation_contexts') == ['mission_id', 'resume_state']
+    assert check_list(conn, 'mission_reconciliation_contexts', 'resume_state') == [
+        'RUNNING', 'CANCELLING']
 
 
 def test_mission_steps_table_holds_only_identity_order_and_state(conn):

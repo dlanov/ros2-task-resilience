@@ -396,6 +396,35 @@ class RecoveryEvidenceRecord:
             self.result_message_prefix.encode('utf-8', 'surrogatepass'))
 
 
+@dataclass(frozen=True)
+class MissionReconciliationContextRecord:
+    """
+    The mission state to restore once a NEEDS_RECONCILIATION mission can leave reconciliation.
+
+    Durable active intent, not history, evidence, authorization or a permission. It exists while
+    a mission that entered reconciliation through enter_mission_reconciliation is reconciling,
+    and is removed when the reconciliation is resolved. It may be raised from RUNNING to
+    CANCELLING while the mission stays blocked, and never the other way. It says nothing about
+    the mission's current state, and CANCELLING here does not mean anything was cancelled. It has
+    no timestamp: the mission's own updated_at is the time it entered. The table it comes from
+    is not tamper-evident, and a writer that bypasses MissionStore can alter it.
+    """
+
+    mission_id: str
+    resume_state: MissionState
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.mission_id, str):
+            raise TypeError(f'mission_id must be a str, got {self.mission_id!r}')
+        if not self.mission_id:
+            raise ValueError('mission_id must not be empty')
+        if not isinstance(self.resume_state, MissionState):
+            raise TypeError(f'resume_state must be a MissionState, got {self.resume_state!r}')
+        if self.resume_state not in (MissionState.RUNNING, MissionState.CANCELLING):
+            raise ValueError(
+                f'resume_state must be RUNNING or CANCELLING, got {self.resume_state.name}')
+
+
 def validate_step_keys(step_keys: Iterable[str]) -> tuple[str, ...]:
     # A bare string is iterable and would silently become one step per character.
     if isinstance(step_keys, (str, bytes)):

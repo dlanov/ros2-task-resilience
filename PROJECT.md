@@ -3,7 +3,7 @@
 > **Working title:** ROS 2 Task Resilience
 > **Working repository name:** `ros2-task-resilience`
 > **Initial ROS packages:** `task_resilience_msgs`, `task_resilience`, `task_resilience_demos`
-> **Status:** Phase 1 (durable mission core) in progress. The ROS-independent core, the Task 006 recovery spike and the Task 007 reconciliation decision model are committed; Task 008 (send authorization and attempt semantics) is complete; Task 009 (the durable action context of a dispatch, schema version 4) is complete; Task 010 (the durable send-authorization provenance of a dispatch, schema version 5) is complete; Task 011 (durable terminal recovery evidence and its atomic application to a step, schema version 6) is complete.
+> **Status:** Phase 1 (durable mission core) in progress. The ROS-independent core, the Task 006 recovery spike and the Task 007 reconciliation decision model are committed; Task 008 (send authorization and attempt semantics) is complete; Task 009 (the durable action context of a dispatch, schema version 4) is complete; Task 010 (the durable send-authorization provenance of a dispatch, schema version 5) is complete; Task 011 (durable terminal recovery evidence and its atomic application to a step, schema version 6) is complete; Task 012 (mission-level reconciliation and the durable state to resume, schema version 7) is complete.
 > **Last updated:** 2026-09-26
 > **Primary maintainer:** Dennis Lanov
 
@@ -387,9 +387,9 @@ The first interface set should remain minimal. Do not create messages merely bec
 
 SQLite is the initial persistence mechanism.
 
-### Implemented so far (schema version 6)
+### Implemented so far (schema version 7)
 
-The schema version is `PRAGMA user_version`. A version 1, 2, 3, 4 or 5 database migrates to version 6 when it is opened, in one transaction.
+The schema version is `PRAGMA user_version`. A version 1, 2, 3, 4, 5 or 6 database migrates to version 7 when it is opened, in one transaction.
 
 - `missions`: mission ID, external request ID, request fingerprint and canonical payload, attempt limit and attempts used, `mission_state`, and created/updated timestamps.
 - `mission_steps`: mission ID, caller-supplied stable `step_key`, `step_index` (order), `step_state`, and created/updated timestamps. Nothing else is stored per step yet.
@@ -397,8 +397,9 @@ The schema version is `PRAGMA user_version`. A version 1, 2, 3, 4 or 5 database 
 - `dispatch_contexts`: the action a dispatch is declared to reach, keyed by its dispatch UUID: `action_name`, `action_type` and `robot_namespace`, exact strings. At most one per dispatch. A dispatch that predates version 4 has none, and none is made up.
 - `dispatch_authorizations`: one row per dispatch for which `authorize_step_send` committed a send authorization, keyed by its dispatch UUID, with `authorized_at`. Under the supported-store contract only that operation writes one, and the table is not tamper-evident. Nothing else is stored in it: no attempt number, no evidence. A dispatch authorized before version 5 has none, and none is made up.
 - `recovery_evidence`: one row per recorded terminal observation, keyed by the caller's evidence ID, for a dispatch: the observed terminal status, the opaque `result_code` (canonical hexadecimal text), a bounded message prefix with its exact length and the SHA-256 of the whole message, the step's state before, the outcome, and the store's own receipt time. Not tamper-evident. Migration creates none, and a dispatch from an older version has none.
+- `mission_reconciliation_contexts`: one row per mission that is `NEEDS_RECONCILIATION` under supported code, keyed by the mission ID, with `resume_state` (`RUNNING` or `CANCELLING`): the mission state to restore when the reconciliation is resolved. Durable active intent, not history, evidence, authorization or a permission. Only `enter_mission_reconciliation` inserts a row, only `request_cancellation_during_reconciliation` updates one (`RUNNING` to `CANCELLING`, never back), and only `resolve_mission_reconciliation` deletes one. No timestamp, no reason, no history. Not tamper-evident. Migration creates none: a mission that was already `NEEDS_RECONCILIATION` has none and fails closed.
 
-Every ordinary state change is validated by the state model (section 13) inside a write transaction. Task 011 additionally has a dedicated evidence-only resolution of `OUTCOME_UNKNOWN`, gated by correlated terminal evidence and durable send-authorization provenance; it does not add an ordinary state-machine edge.
+Every ordinary state change is validated by the state model (section 13) inside a write transaction. Task 011 additionally has a dedicated evidence-only resolution of `OUTCOME_UNKNOWN`, gated by correlated terminal evidence and durable send-authorization provenance; it does not add an ordinary state-machine edge. Task 012 adds a second dedicated exit, `NEEDS_RECONCILIATION` to the mission state recorded in its reconciliation context, gated by the clearing condition that no persisted step is `OUTCOME_UNKNOWN`. The target is never supplied by a caller, and this exit adds no ordinary state-machine edge either.
 
 ### Dispatch identity
 
@@ -458,7 +459,19 @@ Task 011. Full description: `docs/recovery_evidence_model.md`.
 - **Exact facts.** `result_code` is any integer, kept as canonical hexadecimal text. Of the message a prefix of at most 1024 bytes is kept, with its exact length and the SHA-256 of the whole message. The SHA-256 is a content identity only: not authentication, not tamper evidence, not authorization provenance. The table is not tamper-evident.
 - **Reading.** `get_recovery_evidence(mission_id, step_key)` returns strictly parsed rows ordered by evidence ID: deterministic, not chronological.
 - **No mission row and no attempt is ever written**, no send is authorized and nothing external happens. Migration to version 6 is a pure `CREATE TABLE` with zero rows.
-- A migrated version 4 step that is `OUTCOME_UNKNOWN` cannot be settled by Task 011 and stays held until some explicit legacy mechanism exists. `NEEDS_RECONCILIATION` still has no exit, which is Task 012's problem.
+- A migrated version 4 step that is `OUTCOME_UNKNOWN` cannot be settled by Task 011 and stays held until some explicit legacy mechanism exists. A mission blocked by one stays `NEEDS_RECONCILIATION` under Task 012 (see "Mission reconciliation").
+
+### Mission reconciliation
+
+Task 012. Full description: `docs/mission_reconciliation_model.md`.
+
+- **Why version 7 stores a resume state.** The six version 6 tables cannot tell a mission that entered `NEEDS_RECONCILIATION` from `RUNNING` from one that entered from `CANCELLING`, so restoring "the" state would lose a cancellation or make the caller choose it. `mission_reconciliation_contexts.resume_state` is durable active intent, not history: `RUNNING` or `CANCELLING`, recorded in the transaction that moves the mission.
+- **The reason is objective.** Under supported code a mission is `NEEDS_RECONCILIATION` because a persisted step was `OUTCOME_UNKNOWN` when it entered, and it can leave only when none is. The generic `transition_mission_state(..., NEEDS_RECONCILIATION)` is refused with `MissionReconciliationEntryRequired`, before any database access, for every mission (this replaces the older contract that the caller chose it). The pure state-machine edge is unchanged. Entry is `enter_mission_reconciliation`, for a `RUNNING` or `CANCELLING` mission with an unknown step; an exact replay returns the existing context and writes nothing.
+- **Resolution restores, and only restores.** `resolve_mission_reconciliation` is a dedicated storage-level exit that restores exactly the recorded `resume_state`, never a caller's target and never `COMPLETED`, `FAILED` or `CANCELLED`, once no persisted step is `OUTCOME_UNKNOWN` (otherwise the existing `MissionReconciliationRequired`, naming the steps in order). It reads only the step states: no recovery evidence, dispatch or authorization. A `CONFLICT` row or `UNPROVEN` evidence on a step that is not unknown does not block it. It is a state-based operation on the current reconciliation, not an operation keyed by an ID: after a committed resolution a retry is `MissionNotAwaitingReconciliation`.
+- **Cancellation intent.** `request_cancellation_during_reconciliation` raises the stored intent from `RUNNING` to `CANCELLING`, in SQL that cannot go back, and touches nothing else: not the mission row, a step, an attempt, or ROS. It cancels nothing and releases nothing; it says only which state to resume.
+- **No motion is authorized.** Restoring `RUNNING` restores a state. Task 008's gates stay authoritative, `NEEDS_RECONCILIATION` and a restored `CANCELLING` both refuse a send with `MissionNotRunning`, and nothing here touches an attempt or completes a mission: the completion invariant stays where it is.
+- **Held and legacy missions fail closed, on purpose.** A held unknown step (no authorization row) keeps its mission `NEEDS_RECONCILIATION` and blocked indefinitely, and a mission that was `NEEDS_RECONCILIATION` under version 6 has no context and every reconciliation operation on it raises `MissionReconciliationContextMissing`. Operator attestation, an abandon or override exit, legacy adoption and provenance synthesis are deferred.
+- The context table is not tamper-evident. Migration to version 7 is one `CREATE TABLE` with zero rows.
 
 ### Send authorization and attempts
 
@@ -537,6 +550,8 @@ OUTCOME_UNKNOWN
 ```
 
 The distinction between a locally recorded dispatch intention and evidence that the downstream server accepted/executed it is important. `DISPATCHED` is a committed send authorization, not evidence that anything was sent.
+
+`NEEDS_RECONCILIATION` and `OUTCOME_UNKNOWN` have no ordinary exit. `NEEDS_RECONCILIATION` cannot be entered by a plain transition either: the store enters it with `enter_mission_reconciliation` and leaves it with `resolve_mission_reconciliation`, and an `OUTCOME_UNKNOWN` step is left only by Task 011's evidence (`docs/mission_reconciliation_model.md`, `docs/recovery_evidence_model.md`).
 
 State names may change after implementation review.
 
@@ -744,7 +759,7 @@ general robot autonomy framework
 
 These should be resolved by implementation evidence rather than speculation:
 
-1. Exact mission/action schema. (The persisted mission/step schema is implemented as version 5; the ROS action schema is still open.)
+1. Exact mission/action schema. (The persisted mission/step schema is implemented as version 7; the ROS action schema is still open.)
 2. Exact transaction boundaries around Nav2 dispatch. (The boundary of the send authorization is settled by Task 008; the adapter's send and the recording of its result are not.)
 3. How much downstream ROS action state can be reconciled after different crash timings.
 4. Whether to expose attempt budgets in the public action interface in v0.1.
@@ -754,7 +769,7 @@ These should be resolved by implementation evidence rather than speculation:
 8. Minimum supported ROS 2 distributions beyond Jazzy.
 9. ~~Final licensing choice.~~ Resolved: Apache-2.0.
 10. Which failure semantics belong in the generic core versus the Nav2 adapter.
-11. Mission-level, evidence-backed reconciliation. `NEEDS_RECONCILIATION` has no exit, so evidence can settle the steps of such a mission and nothing can move the mission on. This is the follow-up of Task 011 (Task 012).
+11. Mission-level, evidence-backed reconciliation. Resolved for now by Task 012 (complete): a mission leaves `NEEDS_RECONCILIATION` and resumes its recorded state once no step is unknown. Still open, and deferred: what may ever release a mission blocked by a held unknown step or by a version 6 reconciliation (an operator attestation, an abandon exit).
 
 ## 22. Milestones
 
@@ -772,7 +787,7 @@ Phase 1 (section 16) is the current milestone. It proceeds in bounded tasks:
 - Task 009, immutable durable dispatch action context: **COMPLETE**. The action name, type and robot namespace a dispatch is declared to reach are bound to it, together with its UUID and `DISPATCH_PREPARED`, in one transaction (schema version 4, one new table). Declared intent, not proof of where a request was sent. `authorize_step_send` requires a bound context. No evidence is stored and no reconciliation is applied. See `docs/dispatch_context_model.md`.
 - Task 010, durable send-authorization provenance: **COMPLETE**. `authorize_step_send` now commits, in one transaction, the attempt, one row in the new `dispatch_authorizations` table (the dispatch and the store's authorization time) and `DISPATCHED` (schema version 5, one new table). Under the supported-store contract the row means only that `authorize_step_send` committed the authorization (the table is not tamper-evident): not that a request was sent, and not a permission. The attempt number is not stored. Migration creates no row for an earlier dispatch, and no row is not proof that nothing was authorized. No evidence is stored in that table and no reconciliation is applied by that task: terminal recovery evidence and its application are Task 011. See `docs/dispatch_authorization_model.md`.
 - Task 011, durable terminal recovery evidence and atomic evidence-backed step-state application: **COMPLETE**. `MissionStore.apply_recovery_observation` records a terminal `RESULT_RESPONSE` in the new `recovery_evidence` table (schema version 6, one new table) and applies it to the step through Task 007's decision, but only when the dispatch has Task 010 authorization provenance. Without it the evidence is recorded as `UNPROVEN_AUTHORIZATION` and not applied, a prepared step that is seen to finish becomes `OUTCOME_UNKNOWN` through the existing ordinary edge so the supported path can no longer authorize it, and an unknown step with no provenance is held. Evidence IDs bind to one observation for good, different IDs are distinct corroborating rows, `result_code` is kept exactly as canonical hexadecimal, and a message is kept as a bounded prefix with its exact size and SHA-256 (a content identity only). No mission row or attempt is ever written. See `docs/recovery_evidence_model.md`.
-- Task 012, mission-level evidence-backed reconciliation: **NEXT, NOT STARTED**. In particular `NEEDS_RECONCILIATION` has no exit. The ROS adapter and supervisor come after that, unless a review finds a better sequence.
+- Task 012, mission-level evidence-backed reconciliation: **COMPLETE**. A mission enters `NEEDS_RECONCILIATION` only through `MissionStore.enter_mission_reconciliation`, because a persisted step is `OUTCOME_UNKNOWN`, and the mission state to resume (`RUNNING` or `CANCELLING`) is recorded in the same transaction in the new `mission_reconciliation_contexts` table (schema version 7, one new table, no timestamp). A plain transition into it is refused with `MissionReconciliationEntryRequired`. `resolve_mission_reconciliation` restores exactly that state, never a caller's target, once no persisted step is `OUTCOME_UNKNOWN`; it never completes, fails or cancels a mission, authorizes a send, touches an attempt or reads recovery evidence. `request_cancellation_during_reconciliation` raises the stored intent from `RUNNING` to `CANCELLING` and never back, and cancels nothing. A held unknown step, or a mission that was `NEEDS_RECONCILIATION` under version 6, keeps the mission blocked: that fail-closed outcome is accepted, and operator attestation or an abandon exit is deferred. `state_machine.py` and `reconciliation.py` are unchanged. See `docs/mission_reconciliation_model.md`. The ROS adapter and supervisor come after this.
 
 ### M0: Hardware-Free Nav2 Baseline — COMPLETE
 

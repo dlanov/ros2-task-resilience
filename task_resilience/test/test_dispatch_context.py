@@ -85,6 +85,7 @@ COLUMNS = {
         'result_message_bytes', 'result_message_sha256', 'step_state_before', 'outcome',
         'recorded_at',
     ],
+    'mission_reconciliation_contexts': ['mission_id', 'resume_state'],
 }
 V3_TABLES = ['missions', 'mission_steps', 'step_dispatches']
 V4_TABLES = [*V3_TABLES, 'dispatch_contexts']
@@ -271,21 +272,24 @@ def make_v3_database(path):
 
 # The schema
 
-def test_the_schema_is_exactly_version_6_and_the_context_table_stores_no_evidence(db_path):
+def test_the_schema_is_exactly_version_7_and_the_context_table_stores_no_evidence(db_path):
     MissionStore(db_path).close()
 
-    assert storage.SCHEMA_VERSION == 6
-    assert raw(db_path, 'PRAGMA user_version') == [(6,)]
+    assert storage.SCHEMA_VERSION == 7
+    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
     assert table_names(db_path) == set(COLUMNS)
-    # Version 4 added the context table, version 5 the authorization table and version 6 the one
-    # evidence table.
+    # Version 4 added the context table, version 5 the authorization table, version 6 the one
+    # evidence table and version 7 the one reconciliation table.
     assert set(COLUMNS) - set(V3_TABLES) == {
-        'dispatch_contexts', 'dispatch_authorizations', 'recovery_evidence'}
-    assert set(COLUMNS) - set(V4_TABLES) == {'dispatch_authorizations', 'recovery_evidence'}
-    # recovery_evidence is the only table named for evidence. The context table still holds none.
-    assert [name for name in table_names(db_path)
-            if any(word in name for word in ('evidence', 'observation', 'reconcil'))] == [
-        'recovery_evidence']
+        'dispatch_contexts', 'dispatch_authorizations', 'recovery_evidence',
+        'mission_reconciliation_contexts'}
+    assert set(COLUMNS) - set(V4_TABLES) == {
+        'dispatch_authorizations', 'recovery_evidence', 'mission_reconciliation_contexts'}
+    # The only tables named for evidence or reconciliation are those two. The context table still
+    # holds no evidence.
+    assert sorted(name for name in table_names(db_path)
+                  if any(word in name for word in ('evidence', 'observation', 'reconcil'))) == [
+        'mission_reconciliation_contexts', 'recovery_evidence']
     for table, columns in COLUMNS.items():
         assert [row[1] for row in raw(db_path, f'PRAGMA table_info({table})')] == columns
 
@@ -824,7 +828,7 @@ def test_a_migrated_row_and_a_row_whose_context_was_deleted_cannot_be_told_apart
             outcomes.append(found)
 
     # Nothing in the schema distinguishes them, so the supported code must not guess.
-    assert shapes[0] == shapes[1] == ([('DISPATCH_PREPARED',)], [(1,)], [(0,)], [(6,)])
+    assert shapes[0] == shapes[1] == ([('DISPATCH_PREPARED',)], [(1,)], [(0,)], [(7,)])
     assert outcomes[0] == outcomes[1] == [DispatchContextMissing] * 3
 
 
@@ -1232,7 +1236,9 @@ def test_the_new_errors_carry_their_facts_and_are_distinct():
 def test_the_store_has_no_public_way_to_update_or_replace_a_context():
     public = [name for name in dir(MissionStore) if not name.startswith('_')]
 
-    assert [name for name in public if 'context' in name] == ['get_dispatch_context']
+    # The reconciliation context of Task 012 is another thing: a mission's, not a dispatch's.
+    assert [name for name in public if 'context' in name] == [
+        'get_dispatch_context', 'get_mission_reconciliation_context']
     assert not [name for name in public if any(
         word in name for word in ('replace', 'update', 'rebind', 'overwrite', 'rewrite',
                                   'set_context', 'bind_'))]
@@ -1373,22 +1379,22 @@ def legacy_rows(path, origin):
 ORIGINS = {'v1': make_v1_database, 'v2': make_v2_database, 'v3': make_v3_database}
 
 
-def test_a_fresh_database_is_created_at_version_6(db_path):
+def test_a_fresh_database_is_created_at_version_7(db_path):
     MissionStore(db_path).close()
 
-    assert raw(db_path, 'PRAGMA user_version') == [(6,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
     assert table_names(db_path) == set(COLUMNS)
 
 
 @pytest.mark.parametrize('origin', list(ORIGINS))
-def test_every_older_database_migrates_to_version_6_without_changing_a_row(
+def test_every_older_database_migrates_to_version_7_without_changing_a_row(
         db_path, tmp_path, origin):
     ORIGINS[origin](db_path)
     before = legacy_rows(db_path, origin)
 
     MissionStore(db_path).close()
 
-    assert raw(db_path, 'PRAGMA user_version') == [(6,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
     assert legacy_rows(db_path, origin) == before
     assert table_names(db_path) == set(COLUMNS)
     # No context was made up for a dispatch that has none.
@@ -1397,6 +1403,8 @@ def test_every_older_database_migrates_to_version_6_without_changing_a_row(
     assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_authorizations') == [(0,)]
     # And no evidence, for a dispatch of any state.
     assert raw(db_path, 'SELECT COUNT(*) FROM recovery_evidence') == [(0,)]
+    # And no reconciliation context, for a mission that was already reconciling.
+    assert raw(db_path, 'SELECT COUNT(*) FROM mission_reconciliation_contexts') == [(0,)]
     MissionStore(tmp_path / 'fresh.db').close()
     assert schema_of(db_path) == schema_of(tmp_path / 'fresh.db')
 
@@ -1414,7 +1422,7 @@ def test_migrated_dispatches_keep_every_cell_and_gain_no_context(db_path):
     assert dump(db_path)['dispatch_contexts'] == []
 
 
-def test_the_version_3_migration_only_creates_the_three_tables(monkeypatch, db_path):
+def test_the_version_3_migration_only_creates_the_four_tables(monkeypatch, db_path):
     make_v3_database(db_path)
 
     store, connection = open_faulty_store(monkeypatch, db_path)
@@ -1422,21 +1430,23 @@ def test_the_version_3_migration_only_creates_the_three_tables(monkeypatch, db_p
 
     statements = connection.statements
     changing = writes(statements)
-    assert len(changing) == 3
+    assert len(changing) == 4
     assert changing[0].startswith('CREATE TABLE dispatch_contexts (')
     assert changing[1].startswith('CREATE TABLE dispatch_authorizations (')
     assert changing[2].startswith('CREATE TABLE recovery_evidence (')
+    assert changing[3].startswith('CREATE TABLE mission_reconciliation_contexts (')
     # No table was rebuilt: nothing dropped, renamed, altered, copied or filled.
     assert not [sql for sql in statements if sql.split()[0] in ('ALTER', 'DROP', 'INSERT')]
-    # Versions 4 and 5 are never committed on the way: the one write of the version is the last.
+    # Versions 4, 5 and 6 are never committed on the way: the one write of the version is the last.
     assert 'PRAGMA user_version = 4' not in statements
     assert 'PRAGMA user_version = 5' not in statements
-    assert statements.count('PRAGMA user_version = 6') == 1
-    assert statements.index(changing[2]) < statements.index('PRAGMA user_version = 6') < (
-        statements.index('COMMIT'))
+    assert 'PRAGMA user_version = 6' not in statements
+    assert statements.count('PRAGMA user_version = 7') == 1
+    assert (statements.index(changing[3]) < statements.index('PRAGMA user_version = 7')
+            < statements.index('COMMIT'))
 
 
-def test_reopening_a_version_6_database_changes_nothing(monkeypatch, db_path):
+def test_reopening_a_version_7_database_changes_nothing(monkeypatch, db_path):
     make_v3_database(db_path)
     MissionStore(db_path).close()
     before = (dump(db_path), schema_of(db_path))
@@ -1446,7 +1456,7 @@ def test_reopening_a_version_6_database_changes_nothing(monkeypatch, db_path):
 
     assert (dump(db_path), schema_of(db_path)) == before
     assert writes(connection.statements) == []
-    assert raw(db_path, 'PRAGMA user_version') == [(6,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
 
 
 def test_concurrent_opens_of_a_version_3_database_migrate_it_once(tmp_path):
@@ -1465,11 +1475,12 @@ def test_concurrent_opens_of_a_version_3_database_migrate_it_once(tmp_path):
             for future in [pool.submit(open_and_close) for _ in range(workers)]:
                 future.result(timeout=TIMEOUT)
 
-        assert raw(path, 'PRAGMA user_version') == [(6,)]
+        assert raw(path, 'PRAGMA user_version') == [(7,)]
         assert dump(path, V3_TABLES) == before
         assert raw(path, 'SELECT COUNT(*) FROM dispatch_contexts') == [(0,)]
         assert raw(path, 'SELECT COUNT(*) FROM dispatch_authorizations') == [(0,)]
         assert raw(path, 'SELECT COUNT(*) FROM recovery_evidence') == [(0,)]
+        assert raw(path, 'SELECT COUNT(*) FROM mission_reconciliation_contexts') == [(0,)]
         MissionStore(tmp_path / f'fresh-{round_index}.db').close()
         assert schema_of(path) == schema_of(tmp_path / f'fresh-{round_index}.db')
 
@@ -1487,7 +1498,7 @@ def assert_still_version_3(db_path, before, schema):
 
 @pytest.mark.parametrize('failing', [
     'create the context table', 'create the authorization table', 'create the evidence table',
-    'set the version', 'commit'])
+    'create the reconciliation table', 'set the version', 'commit'])
 def test_a_failure_while_migrating_from_version_3_rolls_back_cleanly(
         monkeypatch, db_path, failing):
     make_v3_database(db_path)
@@ -1499,6 +1510,7 @@ def test_a_failure_while_migrating_from_version_3_rolls_back_cleanly(
             'create the context table': '_DISPATCH_CONTEXTS_DDL',
             'create the authorization table': '_DISPATCH_AUTHORIZATIONS_DDL',
             'create the evidence table': '_RECOVERY_EVIDENCE_DDL',
+            'create the reconciliation table': '_MISSION_RECONCILIATION_CONTEXTS_DDL',
         }[failing]
         with monkeypatch.context() as patch:
             patch.setattr(storage, ddl, 'THIS IS NOT SQL')
@@ -1506,7 +1518,7 @@ def test_a_failure_while_migrating_from_version_3_rolls_back_cleanly(
                 MissionStore(db_path)
     else:
         fails = {
-            'set the version': lambda sql: sql.strip() == 'PRAGMA user_version = 6',
+            'set the version': lambda sql: sql.strip() == 'PRAGMA user_version = 7',
             'commit': lambda sql: sql.strip().upper() == 'COMMIT',
         }[failing]
         with pytest.raises(sqlite3.OperationalError, match='injected failure'):
@@ -1516,13 +1528,14 @@ def test_a_failure_while_migrating_from_version_3_rolls_back_cleanly(
     # A later, healthy open finishes the migration.
     with MissionStore(db_path):
         pass
-    assert raw(db_path, 'PRAGMA user_version') == [(6,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
     assert dump(db_path, V3_TABLES) == before
 
 
 @pytest.mark.parametrize('origin', ['v1', 'v2'])
 @pytest.mark.parametrize('ddl', [
-    '_DISPATCH_CONTEXTS_DDL', '_DISPATCH_AUTHORIZATIONS_DDL', '_RECOVERY_EVIDENCE_DDL'])
+    '_DISPATCH_CONTEXTS_DDL', '_DISPATCH_AUTHORIZATIONS_DDL', '_RECOVERY_EVIDENCE_DDL',
+    '_MISSION_RECONCILIATION_CONTEXTS_DDL'])
 def test_a_failure_at_a_late_step_leaves_an_older_database_at_its_own_version(
         monkeypatch, db_path, origin, ddl):
     ORIGINS[origin](db_path)
@@ -1983,8 +1996,13 @@ def test_the_store_still_offers_no_way_to_force_reconcile_or_send():
     public = [name for name in dir(MissionStore) if not name.startswith('_')]
 
     assert not [name for name in public if any(
-        word in name for word in ('reconcil', 'resolve', 'force', 'override', 'set_state',
-                                  'retry', 'send_goal'))]
+        word in name for word in ('force', 'override', 'set_state', 'retry', 'send_goal'))]
+    # The only public names about reconciliation are the four of Task 012. None of them forces a
+    # state: each takes a mission and nothing else (see test_mission_reconciliation.py).
+    assert sorted(name for name in public if any(
+        word in name for word in ('reconcil', 'resolve'))) == [
+        'enter_mission_reconciliation', 'get_mission_reconciliation_context',
+        'request_cancellation_during_reconciliation', 'resolve_mission_reconciliation']
     # The only public names about evidence or observations are the two of Task 011.
     assert sorted(name for name in public if any(
         word in name for word in ('evidence', 'observation'))) == [

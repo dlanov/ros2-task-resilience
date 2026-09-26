@@ -311,8 +311,9 @@ v2 -> v3 -> v4 -> v5 -> v6
 v1 -> v2 -> v3 -> v4 -> v5 -> v6
 ```
 
-A migrated database has the same schema text as a fresh version 6 database. Nothing is inferred about
-what was observed before the table existed.
+A migrated database has the same schema text as a fresh database of the same version. Nothing is
+inferred about what was observed before the table existed. Task 012 has since added schema version 7 and
+one more step to every chain above, and changes nothing of this table.
 
 ## Legacy databases
 
@@ -332,6 +333,11 @@ failure or cancellation, and no way out of `NEEDS_RECONCILIATION`. The mission s
 Task 007: late evidence is recorded and applied whether the mission is running, cancelling, cancelled,
 failed or waiting for reconciliation (each is tested). `OUTCOME_UNKNOWN` alone is enough to close Task 008's authorization gate for
 the mission. A discrepancy caused by an unsupported execution remains a historical discrepancy.
+
+Moving the mission out of `NEEDS_RECONCILIATION` is Task 012's, and it does so from the persisted step
+states alone: `resolve_mission_reconciliation` reads no evidence, so a `CONFLICT` row or `UNPROVEN` evidence
+never blocks it, and a held unknown step (which this task leaves `OUTCOME_UNKNOWN`) does
+(`docs/mission_reconciliation_model.md`). Task 011 still never moves a mission.
 
 ## Crashes and concurrency
 
@@ -354,11 +360,13 @@ It does not query ROS, send, cancel or retry anything, run an adapter or a super
 or add anything to the state machine. It stores no evidence that is not a terminal result, and it does not
 authenticate or independently verify where an observation came from.
 
-**Task 012** should address mission-level, evidence-backed reconciliation. In particular
-`NEEDS_RECONCILIATION` currently has no exit: evidence can now settle the steps of such a mission, and
-nothing can move the mission on. The ROS adapter and supervisor come after that, unless a review finds a
+Mission-level reconciliation is Task 012 (`docs/mission_reconciliation_model.md`): a mission enters
+`NEEDS_RECONCILIATION` through `enter_mission_reconciliation` and leaves it through
+`resolve_mission_reconciliation` once evidence, or anything else supported, has left no step
+`OUTCOME_UNKNOWN`. A held unknown step, which this task never settles, keeps its mission blocked there
+indefinitely. That is intentional. The ROS adapter and supervisor come after that, unless a review finds a
 better sequence.
 
-Not decided here: a legacy or operator-attestation mechanism for a migrated version 4 dispatch; a
-retention, cap or compaction policy for evidence rows; recording non-terminal observations; retries;
-leases and fencing.
+Not decided here: a legacy or operator-attestation mechanism for a migrated version 4 dispatch, and any way
+to release a mission blocked by a held step; a retention, cap or compaction policy for evidence rows;
+recording non-terminal observations; retries; leases and fencing.

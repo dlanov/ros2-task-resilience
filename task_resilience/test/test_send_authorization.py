@@ -82,6 +82,7 @@ COLUMNS = {
         'result_message_bytes', 'result_message_sha256', 'step_state_before', 'outcome',
         'recorded_at',
     ],
+    'mission_reconciliation_contexts': ['mission_id', 'resume_state'],
 }
 
 # The one table that a committed authorization adds a row to. No other table gains or loses one.
@@ -118,7 +119,8 @@ MISSION_ROUTES = {
     M.COMPLETED: None,
     M.FAILED: (M.RUNNING, M.FAILED),
     M.CANCELLED: (M.CANCELLED,),
-    M.NEEDS_RECONCILIATION: (M.RUNNING, M.NEEDS_RECONCILIATION),
+    # Entered through enter_mission_reconciliation, once a step is unknown: see the gate test.
+    M.NEEDS_RECONCILIATION: (M.RUNNING,),
 }
 
 
@@ -440,6 +442,10 @@ def test_only_a_step_that_awaits_its_send_can_be_authorized(store, db_path, stat
 def test_only_a_running_mission_authorizes_a_send(store, db_path, state):
     route = MISSION_ROUTES[state]
     mission_id = make_mission(store, route=route or ())
+    if state is M.NEEDS_RECONCILIATION:
+        # A mission reconciles because a step of it is unknown.
+        store.transition_step_state(mission_id, 'return_to_base', S.OUTCOME_UNKNOWN)
+        store.enter_mission_reconciliation(mission_id)
     if route is None:
         # No ordinary way to COMPLETED while a step is still prepared, so the row is set
         # directly. The gate must hold for a state that should not occur here as well.
@@ -539,7 +545,7 @@ def test_authorization_proceeds_once_no_step_is_unknown(store, db_path):
 def test_a_mission_that_is_not_running_is_reported_before_an_unknown_step(store):
     mission_id = make_mission(store, route=(M.RUNNING,))
     store.transition_step_state(mission_id, 'return_to_base', S.OUTCOME_UNKNOWN)
-    store.transition_mission_state(mission_id, M.NEEDS_RECONCILIATION)
+    store.enter_mission_reconciliation(mission_id)
 
     with pytest.raises(MissionNotRunning):
         store.authorize_step_send(mission_id, 'checkpoint_a')
@@ -613,6 +619,7 @@ def test_a_migrated_prepared_step_without_an_identity_cannot_be_authorized(db_pa
     with contextlib.closing(sqlite3.connect(db_path, isolation_level=None)) as conn:
         conn.execute("UPDATE mission_steps SET step_state = 'DISPATCH_PREPARED'"
                      " WHERE step_key = 'checkpoint_a'")
+        conn.execute('DROP TABLE mission_reconciliation_contexts')
         conn.execute('DROP TABLE recovery_evidence')
         conn.execute('DROP TABLE dispatch_authorizations')
         conn.execute('DROP TABLE dispatch_contexts')
@@ -626,11 +633,12 @@ def test_a_migrated_prepared_step_without_an_identity_cannot_be_authorized(db_pa
 
         assert 'DISPATCH_PREPARED' in excinfo.value.reason
         assert dump(db_path) == before
-    assert raw(db_path, 'PRAGMA user_version') == [(6,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
     assert raw(db_path, 'SELECT COUNT(*) FROM step_dispatches') == [(0,)]
     assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_contexts') == [(0,)]
     assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_authorizations') == [(0,)]
     assert raw(db_path, 'SELECT COUNT(*) FROM recovery_evidence') == [(0,)]
+    assert raw(db_path, 'SELECT COUNT(*) FROM mission_reconciliation_contexts') == [(0,)]
 
 
 # Direct entry to DISPATCHED
@@ -1257,11 +1265,11 @@ def test_importing_the_store_loads_no_ros_network_or_llm_package():
     assert child.stdout.strip() == '[]'
 
 
-def test_the_schema_is_version_6_with_exactly_the_expected_tables_and_columns(db_path):
+def test_the_schema_is_version_7_with_exactly_the_expected_tables_and_columns(db_path):
     MissionStore(db_path).close()
 
-    assert storage.SCHEMA_VERSION == 6
-    assert raw(db_path, 'PRAGMA user_version') == [(6,)]
+    assert storage.SCHEMA_VERSION == 7
+    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
     tables = {name for (name,) in raw(
         db_path, "SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert tables == set(COLUMNS)

@@ -175,7 +175,11 @@ class MissionNotRunning(Exception):
 
 
 class MissionReconciliationRequired(Exception):
-    """A step of the mission has an unknown outcome, so no new send is authorized."""
+    """
+    A step of the mission has an unknown outcome.
+
+    So no new send is authorized, and a mission that is NEEDS_RECONCILIATION cannot be resolved.
+    """
 
     def __init__(self, mission_id: str, step_keys: tuple[str, ...]) -> None:
         super().__init__(
@@ -306,5 +310,54 @@ class CorruptRecoveryEvidence(Exception):
         self.step_key = step_key
         # The stored value, not a parsed one: an unreadable ID is itself a reason to raise this.
         self.evidence_id = evidence_id
+        self.reason = reason
+        self.value = value
+
+
+class MissionReconciliationEntryRequired(Exception):
+    """A mission can enter NEEDS_RECONCILIATION only through enter_mission_reconciliation."""
+
+    def __init__(self, mission_id: str) -> None:
+        super().__init__(
+            f'mission {mission_id!r} must enter NEEDS_RECONCILIATION with '
+            'enter_mission_reconciliation, not a plain state transition')
+        self.mission_id = mission_id
+
+
+class NoUnknownStepToReconcile(Exception):
+    """A mission can enter reconciliation only while a persisted step is OUTCOME_UNKNOWN."""
+
+    def __init__(self, mission_id: str) -> None:
+        super().__init__(f'mission {mission_id!r} has no step with an unknown outcome')
+        self.mission_id = mission_id
+
+
+class MissionNotAwaitingReconciliation(Exception):
+    """The mission is not in NEEDS_RECONCILIATION, so it has no reconciliation to act on."""
+
+    def __init__(self, mission_id: str, mission_state: enum.Enum) -> None:
+        super().__init__(
+            f'mission {mission_id!r} is {mission_state.value}, not NEEDS_RECONCILIATION')
+        self.mission_id = mission_id
+        self.mission_state = mission_state
+
+
+class MissionReconciliationContextMissing(Exception):
+    """A mission is NEEDS_RECONCILIATION and has no durable reconciliation context."""
+
+    # Nothing is guessed. A mission that was already reconciling under schema version 6 has
+    # none, and the store cannot know whether it was to resume as RUNNING or as CANCELLING.
+    def __init__(self, mission_id: str) -> None:
+        super().__init__(
+            f'mission {mission_id!r} is NEEDS_RECONCILIATION and has no reconciliation context')
+        self.mission_id = mission_id
+
+
+class CorruptMissionReconciliationContext(Exception):
+    """A mission's reconciliation context is malformed or contradicts its mission's state."""
+
+    def __init__(self, mission_id: str, reason: str, value: object = None) -> None:
+        super().__init__(f'reconciliation context of mission {mission_id!r}: {reason}')
+        self.mission_id = mission_id
         self.reason = reason
         self.value = value

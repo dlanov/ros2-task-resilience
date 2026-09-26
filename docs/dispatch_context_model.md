@@ -8,8 +8,9 @@ This note defines the action context that is bound to a dispatch, and how it is 
 
 Schema version 4 adds exactly one table, `dispatch_contexts`. It adds no other table, column or
 index, and it changes no existing row. Task 010 has since moved the schema to version 5 with one more
-table, `dispatch_authorizations` (`docs/dispatch_authorization_model.md`). That changes nothing
-described here: this note is about what version 4 added, and the context is bound, read and
+table, `dispatch_authorizations` (`docs/dispatch_authorization_model.md`), Task 011 to version 6 with the
+evidence table, and Task 012 to version 7 with the reconciliation context of a mission
+(`docs/mission_reconciliation_model.md`). None of that changes anything described here: this note is about what version 4 added, and the context is bound, read and
 protected exactly as below.
 
 The contract in one sentence: **any context created by supported schema version 4 code was
@@ -185,7 +186,7 @@ database that is already at version 4 runs only the version 5 step.
 
 Migration creates **zero** context rows and invents no action name, type or namespace. A
 migrated database has the same schema text as a fresh database of the same version (4 when this
-note was written, 5 since Task 010). The tests build their
+note was written, 7 since Task 012). The tests build their
 version 3 database from the version 3 schema written out in full. That text was checked, when this
 task was written, against what the committed version 3 code creates: the two were identical.
 
@@ -265,6 +266,7 @@ and it does not touch the context. Task 011 has since built Task 007's `Expected
 durable binding and compares recovery observations against it before recording anything
 (`docs/recovery_evidence_model.md`). A dispatch with no context takes no evidence at all: it fails with
 `DispatchContextMissing`, and nothing is stored. Task 011 changes nothing about how a context is bound.
+Task 012's reconciliation context belongs to a mission, not to a dispatch, and reads no dispatch context.
 
 Not decided here: any mission-level consequence of recorded evidence; whether an
 explicit legacy or operator-attestation mechanism should exist for a dispatch that has no context;

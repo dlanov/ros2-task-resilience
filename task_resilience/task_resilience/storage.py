@@ -28,6 +28,7 @@ from .errors import (
     CorruptDispatchAuthorization,
     CorruptDispatchContext,
     CorruptDispatchRecord,
+    CorruptMissionReconciliationContext,
     CorruptRecoveryEvidence,
     CorruptStoredState,
     DispatchAuthorizationMissing,
@@ -38,9 +39,13 @@ from .errors import (
     EvidenceIdConflict,
     EvidenceNotCorrelated,
     IdempotencyConflict,
+    MissionNotAwaitingReconciliation,
     MissionNotFound,
     MissionNotRunning,
+    MissionReconciliationContextMissing,
+    MissionReconciliationEntryRequired,
     MissionReconciliationRequired,
+    NoUnknownStepToReconcile,
     ObservationNotRecordable,
     SendAuthorizationRequired,
     StepDefinitionConflict,
@@ -54,6 +59,7 @@ from .model import (
     DispatchRecord,
     EvidenceOutcome,
     MESSAGE_PREFIX_MAX_BYTES,
+    MissionReconciliationContextRecord,
     MissionRecord,
     MissionRequest,
     RecoveryEvidenceRecord,
@@ -71,9 +77,15 @@ from .reconciliation import (
     ObservationKind,
     RecoveryObservation,
 )
-from .state_machine import MissionState, StepState, transition_mission, transition_step
+from .state_machine import (
+    MissionState,
+    requires_reconciliation,
+    StepState,
+    transition_mission,
+    transition_step,
+)
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 _State = TypeVar('_State', bound=enum.Enum)
 
@@ -238,6 +250,27 @@ CREATE TABLE recovery_evidence (
 )
 """
 
+# The mission state to restore once a NEEDS_RECONCILIATION mission can leave reconciliation. This
+# is durable ACTIVE intent, not history, evidence, authorization or a permission, and unlike the
+# tables above it is meant to change: only enter_mission_reconciliation inserts a row, only
+# request_cancellation_during_reconciliation updates one (RUNNING to CANCELLING, never back), and
+# only resolve_mission_reconciliation deletes one, besides the cascade when the mission is
+# deleted. Under supported code a row exists exactly while its mission is NEEDS_RECONCILIATION.
+# A mission that was already NEEDS_RECONCILIATION before this table existed has none, because
+# nothing says whether it was to resume as RUNNING or as CANCELLING, and none is made up. The
+# table has no timestamp: the mission's updated_at is when it entered. It is not tamper-evident:
+# a writer that bypasses the code can insert, alter or remove a row, and such writes are outside
+# the contract.
+_MISSION_RECONCILIATION_CONTEXTS_DDL = """
+CREATE TABLE mission_reconciliation_contexts (
+    mission_id   TEXT NOT NULL PRIMARY KEY
+                 REFERENCES missions (mission_id) ON DELETE CASCADE,
+    resume_state TEXT NOT NULL CHECK (
+        resume_state IN ('RUNNING', 'CANCELLING')
+    )
+)
+"""
+
 _RENAME_V1_MISSIONS = 'ALTER TABLE missions RENAME TO missions_v1'
 
 _COPY_V1_MISSIONS = """
@@ -316,6 +349,31 @@ _INSERT_AUTHORIZATION = """
 INSERT INTO dispatch_authorizations (dispatch_id, authorized_at)
 VALUES (?, ?)
 """
+
+_RECONCILIATION_CONTEXT_OF_MISSION = (
+    'SELECT * FROM mission_reconciliation_contexts WHERE mission_id = ?')
+
+# The only statement that inserts a reconciliation context, and only enter_mission_reconciliation
+# runs it.
+_INSERT_RECONCILIATION_CONTEXT = """
+INSERT INTO mission_reconciliation_contexts (mission_id, resume_state)
+VALUES (?, ?)
+"""
+
+# The only statement that updates a reconciliation context, and only
+# request_cancellation_during_reconciliation runs it. The WHERE clause makes it monotonic: a
+# context that is already CANCELLING matches no row, so nothing can move it back to RUNNING.
+_RAISE_RESUME_STATE = """
+UPDATE mission_reconciliation_contexts
+SET resume_state = 'CANCELLING'
+WHERE mission_id = ?
+  AND resume_state = 'RUNNING'
+"""
+
+# The only statement that deletes a reconciliation context, and only resolve_mission_reconciliation
+# runs it. The mission's own deletion removes one through the foreign key.
+_DELETE_RECONCILIATION_CONTEXT = (
+    'DELETE FROM mission_reconciliation_contexts WHERE mission_id = ?')
 
 _EVIDENCE_BY_ID = 'SELECT * FROM recovery_evidence WHERE evidence_id = ?'
 
@@ -440,6 +498,25 @@ def _to_authorization(
         step_key=dispatch.step_key,
         authorized_at=parsed,
     )
+
+
+_RESUME_STATES = {
+    state.value: state for state in (MissionState.RUNNING, MissionState.CANCELLING)
+}
+
+
+def _to_reconciliation_context(
+    row: sqlite3.Row, mission_id: str,
+) -> MissionReconciliationContextRecord:
+    # Only the two exact strings this code writes are accepted, and nothing is repaired: a
+    # lower-case spelling, another state, a number or a blob means the row was changed behind
+    # our back. Every caller has already chosen the row by this mission, so mission_id is not read.
+    stored = row['resume_state']
+    resume_state = _RESUME_STATES.get(stored)
+    if resume_state is None:
+        raise CorruptMissionReconciliationContext(
+            mission_id, 'resume_state is not RUNNING or CANCELLING', stored)
+    return MissionReconciliationContextRecord(mission_id=mission_id, resume_state=resume_state)
 
 
 def _canonical_uuid(stored: object) -> uuid.UUID | None:
@@ -634,6 +711,12 @@ class MissionStore:
 
     def transition_mission_state(self, mission_id: str, target: MissionState) -> MissionRecord:
         _require_kind(target, MissionState, 'target')
+        # The pure graph has the edge, but a mission enters NEEDS_RECONCILIATION only with the
+        # durable context that records the state to resume, which is
+        # enter_mission_reconciliation. Refused for every current state, a same-state replay
+        # included, and before any lookup, as DISPATCHED is in transition_step_state.
+        if target is MissionState.NEEDS_RECONCILIATION:
+            raise MissionReconciliationEntryRequired(mission_id)
         with self._transaction():
             mission = self._require(_BY_MISSION_ID, mission_id)
             steps = self._fetch_steps(mission_id)
@@ -975,6 +1058,111 @@ class MissionStore:
         rows = self._conn.execute(_EVIDENCE_OF_DISPATCH, (str(dispatch.dispatch_id),)).fetchall()
         return tuple(_to_evidence(row, dispatch) for row in rows)
 
+    def enter_mission_reconciliation(
+        self, mission_id: str,
+    ) -> MissionReconciliationContextRecord:
+        """
+        Move a RUNNING or CANCELLING mission that has an unknown step to NEEDS_RECONCILIATION.
+
+        The reason is the persisted OUTCOME_UNKNOWN step itself, so nothing about evidence,
+        dispatches or authorizations is read, and an unknown step that can never be resolved
+        does not stop the entry. The mission's current state is recorded, in the same
+        transaction, as the state to resume. A replay on a mission that is already reconciling
+        returns the existing context and writes nothing. A mission that is NEEDS_RECONCILIATION
+        and has no context is a mission from before schema version 7: nothing is adopted or
+        guessed, and it raises MissionReconciliationContextMissing.
+        """
+        with self._transaction():
+            mission = self._require(_BY_MISSION_ID, mission_id)
+            context = self._fetch_reconciliation_context(mission_id)
+            if mission.state is MissionState.NEEDS_RECONCILIATION:
+                if context is None:
+                    raise MissionReconciliationContextMissing(mission_id)
+                return context
+            if context is not None:
+                raise CorruptMissionReconciliationContext(
+                    mission_id, f'mission is {mission.state.value} but has a context',
+                    context.resume_state.value)
+
+            step_states = [step.state for step in self._fetch_steps(mission_id)]
+            # The pure graph decides whether the source state may enter: RUNNING or CANCELLING.
+            transition_mission(mission.state, MissionState.NEEDS_RECONCILIATION, step_states)
+            if not requires_reconciliation(step_states):
+                raise NoUnknownStepToReconcile(mission_id)
+
+            # The context first and the mission last, in one transaction, with one timestamp.
+            self._conn.execute(_INSERT_RECONCILIATION_CONTEXT, (mission_id, mission.state.value))
+            now = _utc_now()
+            self._conn.execute(
+                _SET_MISSION_STATE, (MissionState.NEEDS_RECONCILIATION.value, now, mission_id))
+            # Read back, so the caller gets exactly what is durable, and only when this block
+            # ends: if COMMIT fails, the caller gets that error and no record.
+            return self._require_reconciliation_context(mission_id)
+
+    def resolve_mission_reconciliation(self, mission_id: str) -> MissionRecord:
+        """
+        Restore the mission state the reconciliation context records, once no step is unknown.
+
+        This is a dedicated, non-ordinary exit from NEEDS_RECONCILIATION, and the pure state
+        machine gains no edge. The target is exactly the durable context's resume_state, never a
+        caller's, and it is RUNNING or CANCELLING: this never completes, fails or cancels a
+        mission, authorizes a send or touches an attempt. Only the persisted step states are
+        read to decide, so recovery evidence, dispatches and authorizations are not.
+
+        It is a state-based operation on the CURRENT reconciliation of the mission, not a
+        command keyed by an ID. If a committed resolution's reply is lost, a retry finds the
+        mission no longer reconciling and raises MissionNotAwaitingReconciliation, and if a
+        newer reconciliation has begun the retry acts on that one under the same rule.
+        """
+        with self._transaction():
+            context = self._require_reconciling(mission_id)
+            steps = self._fetch_steps(mission_id)
+            if requires_reconciliation([step.state for step in steps]):
+                raise MissionReconciliationRequired(
+                    mission_id,
+                    tuple(step.step_key for step in steps
+                          if step.state is StepState.OUTCOME_UNKNOWN))
+
+            # The context first and the mission last, in one transaction, with one timestamp.
+            self._conn.execute(_DELETE_RECONCILIATION_CONTEXT, (mission_id,))
+            now = _utc_now()
+            self._conn.execute(_SET_MISSION_STATE, (context.resume_state.value, now, mission_id))
+            return self._require(_BY_MISSION_ID, mission_id)
+
+    def request_cancellation_during_reconciliation(
+        self, mission_id: str,
+    ) -> MissionReconciliationContextRecord:
+        """
+        Record that the mission is to resume as CANCELLING rather than RUNNING.
+
+        Only the reconciliation context changes, from RUNNING to CANCELLING, and never back. The
+        mission stays NEEDS_RECONCILIATION and its row is not written. Nothing is cancelled, no
+        cancel is sent, no step is read or changed, and reconciliation is not released: this
+        only says what to restore when the mission is eventually allowed to leave it.
+        A context that already says CANCELLING is returned unchanged.
+        """
+        with self._transaction():
+            context = self._require_reconciling(mission_id)
+            if context.resume_state is MissionState.CANCELLING:
+                return context
+            if self._conn.execute(_RAISE_RESUME_STATE, (mission_id,)).rowcount != 1:
+                raise CorruptMissionReconciliationContext(
+                    mission_id, 'resume_state was not raised', context.resume_state.value)
+            return self._require_reconciliation_context(mission_id)
+
+    def get_mission_reconciliation_context(
+        self, mission_id: str,
+    ) -> MissionReconciliationContextRecord:
+        """
+        Return the reconciliation context of a mission that is NEEDS_RECONCILIATION.
+
+        Never creates, repairs or guesses one, and writes nothing. The mission's state and the
+        context are read together, so a concurrent entry or resolution cannot leave them
+        contradicting each other.
+        """
+        with self._snapshot():
+            return self._require_reconciling(mission_id)
+
     @contextlib.contextmanager
     def _snapshot(self) -> Iterator[None]:
         # A deferred transaction for reads that must agree with each other. The first read
@@ -1018,7 +1206,8 @@ class MissionStore:
                 self._conn.execute(_DISPATCH_CONTEXTS_DDL)
                 self._conn.execute(_DISPATCH_AUTHORIZATIONS_DDL)
                 self._conn.execute(_RECOVERY_EVIDENCE_DDL)
-            elif version in (1, 2, 3, 4, 5):
+                self._conn.execute(_MISSION_RECONCILIATION_CONTEXTS_DDL)
+            elif version in (1, 2, 3, 4, 5, 6):
                 # An older database goes through every step up to the current version inside
                 # this one transaction, so no version in between is ever committed.
                 if version == 1:
@@ -1029,7 +1218,9 @@ class MissionStore:
                     self._migrate_v3_to_v4()
                 if version <= 4:
                     self._migrate_v4_to_v5()
-                self._migrate_v5_to_v6()
+                if version <= 5:
+                    self._migrate_v5_to_v6()
+                self._migrate_v6_to_v7()
             else:
                 raise UnsupportedSchemaVersion(version)
             self._conn.execute(f'PRAGMA user_version = {SCHEMA_VERSION}')
@@ -1066,6 +1257,11 @@ class MissionStore:
         # table existed that could be recorded from what is already stored.
         self._conn.execute(_RECOVERY_EVIDENCE_DDL)
 
+    def _migrate_v6_to_v7(self) -> None:
+        # Only a table is added. A mission that is already NEEDS_RECONCILIATION gets no context:
+        # whether it was to resume as RUNNING or as CANCELLING cannot be told, so none is made up.
+        self._conn.execute(_MISSION_RECONCILIATION_CONTEXTS_DDL)
+
     def _fetch(self, query: str, value: str) -> MissionRecord | None:
         row = self._conn.execute(query, (value,)).fetchone()
         return None if row is None else _to_record(row)
@@ -1091,6 +1287,36 @@ class MissionStore:
         # Tell an unknown mission apart from an unknown step.
         self._require_mission(mission_id)
         raise StepNotFound(mission_id, step_key)
+
+    def _fetch_reconciliation_context(
+        self, mission_id: str,
+    ) -> MissionReconciliationContextRecord | None:
+        row = self._conn.execute(_RECONCILIATION_CONTEXT_OF_MISSION, (mission_id,)).fetchone()
+        return None if row is None else _to_reconciliation_context(row, mission_id)
+
+    def _require_reconciliation_context(
+        self, mission_id: str,
+    ) -> MissionReconciliationContextRecord:
+        context = self._fetch_reconciliation_context(mission_id)
+        if context is None:
+            raise MissionReconciliationContextMissing(mission_id)
+        return context
+
+    def _require_reconciling(self, mission_id: str) -> MissionReconciliationContextRecord:
+        # The one judgement of a mission's state against its reconciliation context, shared by
+        # every operation that needs an active reconciliation. Reads only: nothing is guessed,
+        # adopted or repaired, and a missing context is never taken to mean anything.
+        mission = self._require(_BY_MISSION_ID, mission_id)
+        context = self._fetch_reconciliation_context(mission_id)
+        if mission.state is not MissionState.NEEDS_RECONCILIATION:
+            if context is not None:
+                raise CorruptMissionReconciliationContext(
+                    mission_id, f'mission is {mission.state.value} but has a context',
+                    context.resume_state.value)
+            raise MissionNotAwaitingReconciliation(mission_id, mission.state)
+        if context is None:
+            raise MissionReconciliationContextMissing(mission_id)
+        return context
 
     def _fetch_dispatch(self, mission_id: str, step_key: str) -> DispatchRecord | None:
         rows = self._conn.execute(_DISPATCHES_OF_STEP, (mission_id, step_key)).fetchall()

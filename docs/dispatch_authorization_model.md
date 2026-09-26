@@ -283,7 +283,9 @@ Task 011 has since added terminal recovery evidence and its application to a ste
 missing row conservatively, as "no proof" and not as proof that nothing was authorized: the evidence is
 recorded and not applied, and it invents no row. It relies on a present row under the same trusted-store
 assumption: the row is not tamper-evident, and no authentication mechanism is added. This table still
-stores no evidence.
+stores no evidence. Task 012 (`docs/mission_reconciliation_model.md`) never reads this table: whether a
+mission can leave `NEEDS_RECONCILIATION` depends on the persisted step states alone, so a step with no row
+that stays `OUTCOME_UNKNOWN` keeps its mission blocked, and nothing here is written, backfilled or attested.
 
 Not decided here: any mission-level consequence; whether an explicit legacy or operator-attestation mechanism should exist
 for dispatches authorized before version 5; retries; leases and fencing; the ROS adapter.

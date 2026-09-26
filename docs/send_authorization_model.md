@@ -177,7 +177,7 @@ Only a `RUNNING` mission may authorize a send.
 | `COMPLETED` | no | Finished. |
 | `FAILED` | no | Finished. |
 | `CANCELLED` | no | Finished. |
-| `NEEDS_RECONCILIATION` | no | An outcome is unresolved, so a send would be blind. |
+| `NEEDS_RECONCILIATION` | no | An outcome is unresolved, so a send would be blind. A mission enters it only through `enter_mission_reconciliation` (Task 012), and a restored `CANCELLING` refuses too. |
 
 Preparation is not gated by mission state and is not changed. A prepared step under a mission
 that is not `RUNNING` is inert: it authorizes nothing and takes no attempt. Recording a late
@@ -190,7 +190,8 @@ authorization is refused and nothing is written. The error names the affected st
 step order.
 
 This closes a crash window. A step becomes unknown in one transaction, and moving the mission to
-`NEEDS_RECONCILIATION` is a separate one. A crash between them leaves a `RUNNING` mission with an
+`NEEDS_RECONCILIATION` is a separate one, and since Task 012 it is entered with
+`enter_mission_reconciliation`. A crash between them leaves a `RUNNING` mission with an
 unknown step, and without this gate a restarted executor could send the next step blind.
 
 It is a narrow gate. It does **not** require earlier steps to have succeeded. Running steps in
@@ -202,6 +203,12 @@ terminal result, supplied for a prepared dispatch that has no authorization, mov
 (`docs/recovery_evidence_model.md`). That closes this gate for the whole mission, and it means the
 supported path can no longer authorize that dispatch: `authorize_step_send` refuses a step that is not
 `DISPATCH_PREPARED`. Recording evidence never consumes, refunds or changes an attempt.
+
+Task 012 (`docs/mission_reconciliation_model.md`) is what lets a `NEEDS_RECONCILIATION` mission leave it,
+once no step is unknown, by restoring the state it was to resume. That restores a state and nothing else. It
+never authorizes a send, and never consumes or refunds an attempt. A mission restored to `RUNNING` is decided
+by the gates above as any `RUNNING` mission is (including the unknown-outcome gate, if another step has become
+unknown meanwhile), and one restored to `CANCELLING` refuses every send with `MissionNotRunning`.
 
 ## Cancellation
 

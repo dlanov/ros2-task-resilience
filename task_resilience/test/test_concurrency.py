@@ -189,7 +189,7 @@ def test_concurrent_first_open_creates_the_schema_once(tmp_path):
                 future.result(timeout=TIMEOUT)
 
         with contextlib.closing(sqlite3.connect(path)) as conn:
-            assert conn.execute('PRAGMA user_version').fetchone()[0] == 6
+            assert conn.execute('PRAGMA user_version').fetchone()[0] == 7
 
 
 def test_lock_timeout_surfaces_and_consumes_nothing(db_path):

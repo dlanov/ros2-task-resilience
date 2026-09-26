@@ -18,6 +18,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import uuid
 
 import pytest
 
@@ -30,10 +31,16 @@ from task_resilience.errors import (
     InvalidStateTransition,
     MissionCompletionInvariantError,
     MissionNotFound,
+    MissionReconciliationEntryRequired,
     SendAuthorizationRequired,
     StepNotFound,
 )
-from task_resilience.reconciliation import ExpectedActionContext
+from task_resilience.reconciliation import (
+    ActionStatus,
+    ExpectedActionContext,
+    ObservationKind,
+    RecoveryObservation,
+)
 from task_resilience.state_machine import MissionState, StepState
 from task_resilience.storage import MissionStore
 
@@ -142,12 +149,18 @@ def test_mission_same_state_is_a_no_op_that_keeps_updated_at(store, running):
 
 
 def test_illegal_mission_transitions_are_rejected_and_write_nothing(store, mission):
-    for target in (M.COMPLETED, M.FAILED, M.CANCELLING, M.NEEDS_RECONCILIATION):
+    for target in (M.COMPLETED, M.FAILED, M.CANCELLING):
         with pytest.raises(InvalidStateTransition) as excinfo:
             store.transition_mission_state(mission.mission_id, target)
         assert excinfo.value.entity == 'mission'
         assert excinfo.value.current is M.ACCEPTED
         assert excinfo.value.target is target
+
+    # NEEDS_RECONCILIATION is refused before the state machine is asked, whatever the state:
+    # the mission enters it only with enter_mission_reconciliation.
+    with pytest.raises(MissionReconciliationEntryRequired) as excinfo:
+        store.transition_mission_state(mission.mission_id, M.NEEDS_RECONCILIATION)
+    assert excinfo.value.mission_id == mission.mission_id
 
     assert store.get_by_mission_id(mission.mission_id) == mission
 
@@ -316,12 +329,15 @@ def test_unknown_outcome_survives_reopening_the_store(db_path):
         store.initialize_steps(mission.mission_id, KEYS)
         store.transition_mission_state(mission.mission_id, M.RUNNING)
         drive(store, mission.mission_id, 'checkpoint_a', S.OUTCOME_UNKNOWN)
-        store.transition_mission_state(mission.mission_id, M.NEEDS_RECONCILIATION)
+        store.enter_mission_reconciliation(mission.mission_id)
 
     with MissionStore(db_path) as reopened:
         assert reopened.get_step(mission.mission_id, 'checkpoint_a').state is S.OUTCOME_UNKNOWN
         assert reopened.get_step(mission.mission_id, 'return_to_base').state is S.PENDING
         assert reopened.get_by_mission_id(mission.mission_id).state is M.NEEDS_RECONCILIATION
+        # The state to resume survives with it.
+        assert reopened.get_mission_reconciliation_context(
+            mission.mission_id).resume_state is M.RUNNING
 
 
 _CHILD = """
@@ -436,9 +452,13 @@ def test_an_unknown_step_outcome_does_not_force_the_mission_state(store, running
 
     assert store.get_by_mission_id(running.mission_id) == running
 
-    # Choosing NEEDS_RECONCILIATION is left to the caller.
-    reconciling = store.transition_mission_state(running.mission_id, M.NEEDS_RECONCILIATION)
-    assert reconciling.state is M.NEEDS_RECONCILIATION
+    # Entering NEEDS_RECONCILIATION is a deliberate call, and only for a mission with an unknown
+    # step. A plain transition into it is refused and changes nothing.
+    with pytest.raises(MissionReconciliationEntryRequired):
+        store.transition_mission_state(running.mission_id, M.NEEDS_RECONCILIATION)
+    assert store.get_by_mission_id(running.mission_id) == running
+    store.enter_mission_reconciliation(running.mission_id)
+    assert store.get_by_mission_id(running.mission_id).state is M.NEEDS_RECONCILIATION
 
 
 def test_no_ordinary_transition_leaves_an_unknown_step_outcome(store, running):
@@ -459,10 +479,20 @@ def test_no_ordinary_transition_leaves_an_unknown_step_outcome(store, running):
 
 
 def test_no_ordinary_transition_leaves_needs_reconciliation(store, running):
-    # Even with every step finished, the mission cannot simply be completed.
-    drive(store, running.mission_id, 'checkpoint_a', S.SUCCEEDED)
+    # Even with every step finished, the mission cannot simply be completed. The mission enters
+    # reconciliation while a step is unknown, and Task 011's evidence then settles that step.
     drive(store, running.mission_id, 'return_to_base', S.SUCCEEDED)
-    store.transition_mission_state(running.mission_id, M.NEEDS_RECONCILIATION)
+    store.prepare_step_dispatch(running.mission_id, 'checkpoint_a', ACTION)
+    dispatch_id = store.get_step_dispatch(running.mission_id, 'checkpoint_a').dispatch_id
+    store.authorize_step_send(running.mission_id, 'checkpoint_a')
+    store.transition_step_state(running.mission_id, 'checkpoint_a', S.OUTCOME_UNKNOWN)
+    store.enter_mission_reconciliation(running.mission_id)
+    store.apply_recovery_observation(
+        uuid.uuid4(), running.mission_id, 'checkpoint_a', RecoveryObservation(
+            kind=ObservationKind.RESULT_RESPONSE, dispatch_id=dispatch_id,
+            action_name=ACTION.action_name, action_type=ACTION.action_type,
+            robot_namespace=ACTION.robot_namespace, status=ActionStatus.SUCCEEDED))
+    assert [step.state for step in store.get_steps(running.mission_id)] == [S.SUCCEEDED] * 2
 
     for target in M:
         if target is not M.NEEDS_RECONCILIATION:
@@ -476,7 +506,13 @@ def test_the_store_offers_no_way_to_bypass_the_state_machine():
     public = [name for name in dir(MissionStore) if not name.startswith('_')]
 
     assert not [name for name in public if any(
-        word in name for word in ('reconcil', 'resolve', 'force', 'override', 'set_state'))]
+        word in name for word in ('force', 'override', 'set_state'))]
+    # The only public names about reconciliation are the four of Task 012, and none of them takes
+    # a state: see test_mission_reconciliation.py.
+    assert sorted(name for name in public if any(
+        word in name for word in ('reconcil', 'resolve'))) == [
+        'enter_mission_reconciliation', 'get_mission_reconciliation_context',
+        'request_cancellation_during_reconciliation', 'resolve_mission_reconciliation']
 
 
 # Stored values are validated on read
