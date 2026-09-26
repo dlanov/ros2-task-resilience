@@ -196,6 +196,13 @@ unknown step, and without this gate a restarted executor could send the next ste
 It is a narrow gate. It does **not** require earlier steps to have succeeded. Running steps in
 order remains a later supervisor policy.
 
+Since Task 011 a step can also become `OUTCOME_UNKNOWN` through recovery evidence: an observation of a
+terminal result, supplied for a prepared dispatch that has no authorization, moves that step to
+`OUTCOME_UNKNOWN`
+(`docs/recovery_evidence_model.md`). That closes this gate for the whole mission, and it means the
+supported path can no longer authorize that dispatch: `authorize_step_send` refuses a step that is not
+`DISPATCH_PREPARED`. Recording evidence never consumes, refunds or changes an attempt.
+
 ## Cancellation
 
 Two serial orders are valid and both are tested:
@@ -286,6 +293,7 @@ a caller should call it. It never does.
 
 ## Not decided here
 
-Retry policy; step ordering; who moves a step stuck at `DISPATCHED` to a reconciled state; a
-protocol for cancelling an authorized step; leases, fencing and single-supervisor exclusion; the
+Retry policy; step ordering; who decides that a step stuck at `DISPATCHED` is settled by something
+other than a terminal result (a terminal result with authorization provenance is applied by Task 011,
+and nothing else moves it except an ordinary transition); a protocol for cancelling an authorized step; leases, fencing and single-supervisor exclusion; the
 ROS adapter that actually sends.

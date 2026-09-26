@@ -3,8 +3,8 @@
 > **Working title:** ROS 2 Task Resilience
 > **Working repository name:** `ros2-task-resilience`
 > **Initial ROS packages:** `task_resilience_msgs`, `task_resilience`, `task_resilience_demos`
-> **Status:** Phase 1 (durable mission core) in progress. The ROS-independent core, the Task 006 recovery spike and the Task 007 reconciliation decision model are committed; Task 008 (send authorization and attempt semantics) is complete; Task 009 (the durable action context of a dispatch, schema version 4) is complete; Task 010 (the durable send-authorization provenance of a dispatch, schema version 5) is complete.
-> **Last updated:** 2026-09-25
+> **Status:** Phase 1 (durable mission core) in progress. The ROS-independent core, the Task 006 recovery spike and the Task 007 reconciliation decision model are committed; Task 008 (send authorization and attempt semantics) is complete; Task 009 (the durable action context of a dispatch, schema version 4) is complete; Task 010 (the durable send-authorization provenance of a dispatch, schema version 5) is complete; Task 011 (durable terminal recovery evidence and its atomic application to a step, schema version 6) is complete.
+> **Last updated:** 2026-09-26
 > **Primary maintainer:** Dennis Lanov
 
 ## 1. Project purpose
@@ -387,17 +387,18 @@ The first interface set should remain minimal. Do not create messages merely bec
 
 SQLite is the initial persistence mechanism.
 
-### Implemented so far (schema version 5)
+### Implemented so far (schema version 6)
 
-The schema version is `PRAGMA user_version`. A version 1, 2, 3 or 4 database migrates to version 5 when it is opened, in one transaction.
+The schema version is `PRAGMA user_version`. A version 1, 2, 3, 4 or 5 database migrates to version 6 when it is opened, in one transaction.
 
 - `missions`: mission ID, external request ID, request fingerprint and canonical payload, attempt limit and attempts used, `mission_state`, and created/updated timestamps.
 - `mission_steps`: mission ID, caller-supplied stable `step_key`, `step_index` (order), `step_state`, and created/updated timestamps. Nothing else is stored per step yet.
 - `step_dispatches`: the durable dispatch UUID of a step, with the mission ID, step key and creation time. At most one per step. A step that was never prepared through the store has none.
 - `dispatch_contexts`: the action a dispatch is declared to reach, keyed by its dispatch UUID: `action_name`, `action_type` and `robot_namespace`, exact strings. At most one per dispatch. A dispatch that predates version 4 has none, and none is made up.
 - `dispatch_authorizations`: one row per dispatch for which `authorize_step_send` committed a send authorization, keyed by its dispatch UUID, with `authorized_at`. Under the supported-store contract only that operation writes one, and the table is not tamper-evident. Nothing else is stored in it: no attempt number, no evidence. A dispatch authorized before version 5 has none, and none is made up.
+- `recovery_evidence`: one row per recorded terminal observation, keyed by the caller's evidence ID, for a dispatch: the observed terminal status, the opaque `result_code` (canonical hexadecimal text), a bounded message prefix with its exact length and the SHA-256 of the whole message, the step's state before, the outcome, and the store's own receipt time. Not tamper-evident. Migration creates none, and a dispatch from an older version has none.
 
-Every state change is validated by the state model (section 13) inside a write transaction.
+Every ordinary state change is validated by the state model (section 13) inside a write transaction. Task 011 additionally has a dedicated evidence-only resolution of `OUTCOME_UNKNOWN`, gated by correlated terminal evidence and durable send-authorization provenance; it does not add an ordinary state-machine edge.
 
 ### Dispatch identity
 
@@ -428,7 +429,7 @@ Task 009. Full description: `docs/dispatch_context_model.md`.
 - There is **no late binding and no backfill**. A missing context is ambiguous: it may be a dispatch prepared under version 3 that never had one, or a version 4 dispatch whose context was removed outside the supported code, and version 4 stores nothing that tells them apart. Supported code therefore fails closed. For a `DISPATCH_PREPARED` step with a UUID and no context, `get_dispatch_context`, `authorize_step_send` and a `prepare_step_dispatch(..., action)` replay all raise `DispatchContextMissing`, consume no attempt, and change no row, state or timestamp. A step that was `PENDING` when migrated gets a UUID and a context together when it is first prepared.
 - Every migrated dispatch that predates a context, whatever its state, stays unbound and is unavailable to a future evidence-backed reconciliation until some separately reviewed mechanism exists. An explicit legacy or operator-attestation mechanism could be designed later if it is needed. It is not designed or implemented.
 - Correlating a result to an action is a different problem from proving the correct goal body was sent. No goal body or goal hash is stored, and that is deferred until the project has a durable per-step goal specification.
-- Task 009 stores the declared context and nothing more. Recording recovery evidence and applying a reconciliation outcome are Task 011.
+- Task 009 stores the declared context and nothing more. Task 011 has since recorded terminal recovery evidence and applied it (see "Recovery evidence" below).
 
 ### Dispatch authorization record
 
@@ -442,7 +443,22 @@ Task 010. Full description: `docs/dispatch_authorization_model.md`.
 - `get_dispatch_authorization(mission_id, step_key)` reads it and writes nothing. A `DISPATCH_PREPARED` step that already has a row is corruption. For a step that has progressed, no row is `DispatchAuthorizationMissing`, not corruption: it means this store has no durable proof, **not** that no authorization was committed.
 - Migration to version 5 is a pure `CREATE TABLE` that creates zero rows. It never infers an old authorization from `DISPATCHED`, `attempts_used` or a timestamp. A prepared step that version 4 wrote is authorized normally under version 5, taking an attempt and writing its row then.
 - `OUTCOME_UNKNOWN` with a row means, under the supported-store contract, that `authorize_step_send` committed an authorization for the dispatch before the later lifecycle. `OUTCOME_UNKNOWN` with no row means version 5 has no durable proof. Task 010 does not decide what either means for recovery, and the state machine is unchanged.
-- No evidence is stored. Terminal recovery evidence, and applying it to a step's state, are Task 011.
+- This table stores no evidence. Task 011 has since added terminal recovery evidence and its application to a step's state, and relies on a present row under this same trusted-store assumption.
+
+### Recovery evidence
+
+Task 011. Full description: `docs/recovery_evidence_model.md`.
+
+- **Terminal results only.** `MissionStore.apply_recovery_observation(evidence_id, mission_id, step_key, observation)` records a `RESULT_RESPONSE` with status `SUCCEEDED`, `CANCELED` or `ABORTED`, and nothing else. Any other observation raises `ObservationNotRecordable` before a transaction is opened. It accepts the raw `RecoveryObservation`, never a caller-made `ReconciliationDecision`.
+- **Task 007 decides.** Inside one transaction the store builds the durable snapshot and the Task 009 context, calls `decide_reconciliation`, and reads `decision.candidate_step_state`. Storage holds no mapping from a status to a step state. An observation that does not correlate is `EvidenceNotCorrelated`.
+- **Provenance gates application, not recording.** With a valid Task 010 authorization row a candidate is applied (`DISPATCHED`, `ACCEPTED`, `EXECUTING` and `CANCEL_REQUESTED` through `transition_step`, and `OUTCOME_UNKNOWN` through a dedicated evidence-only write; the state machine gains no edge). With no row the evidence is recorded as `UNPROVEN_AUTHORIZATION` and is not applied. A malformed row, or a `DISPATCH_PREPARED` step that has a row, is `CorruptDispatchAuthorization` and nothing is stored. No row is no durable proof, not proof that nothing was authorized, and no provenance is invented.
+- **A prepared step that is seen to finish** has no supported history. The evidence is recorded as `UNPROVEN_AUTHORIZATION` and the step moves `DISPATCH_PREPARED` to `OUTCOME_UNKNOWN` through the existing ordinary state-machine edge, so `authorize_step_send`, the supported path, can no longer authorize that dispatch, and the mission-wide gate closes. **A step that is `OUTCOME_UNKNOWN` with no row is held**: no observation ever settles it. The hold is derived from the missing authorization row, not from evidence rows.
+- **A terminal step is never rewritten.** A matching result is `ALREADY_SETTLED` and a contradicting one is `CONFLICT`, with or without provenance.
+- **An evidence ID is bound to one observation for good.** The same ID with the same facts is an exact replay (the stored record, nothing written); any changed fact, or another dispatch, is `EvidenceIdConflict`. A different ID with the same facts is stored as a distinct corroborating row, with no de-duplication, so a caller that keeps generating IDs can grow the table. Every call, replays included, revalidates the durable state first.
+- **Exact facts.** `result_code` is any integer, kept as canonical hexadecimal text. Of the message a prefix of at most 1024 bytes is kept, with its exact length and the SHA-256 of the whole message. The SHA-256 is a content identity only: not authentication, not tamper evidence, not authorization provenance. The table is not tamper-evident.
+- **Reading.** `get_recovery_evidence(mission_id, step_key)` returns strictly parsed rows ordered by evidence ID: deterministic, not chronological.
+- **No mission row and no attempt is ever written**, no send is authorized and nothing external happens. Migration to version 6 is a pure `CREATE TABLE` with zero rows.
+- A migrated version 4 step that is `OUTCOME_UNKNOWN` cannot be settled by Task 011 and stays held until some explicit legacy mechanism exists. `NEEDS_RECONCILIATION` still has no exit, which is Task 012's problem.
 
 ### Send authorization and attempts
 
@@ -455,6 +471,7 @@ Task 010. Full description: `docs/dispatch_authorization_model.md`.
 - An attempt is never refunded automatically: not by a restart, a crash, a rejection, a timeout, an unavailable service, a transport error, a server `UNKNOWN`, or a later cancellation. No retry is authorized by this design.
 - Every new increment made by `authorize_step_send` is a committed send authorization. A nonzero `attempts_used` that predates Task 008, produced by the removed `consume_attempt`, is kept as spent budget. Its cause is not reconstructed, and it is never refunded.
 - The schema allows one dispatch identity per step, so budget beyond the number of steps cannot yet be used as retries. A future retry would consume another mission-wide unit and must use a new dispatch identity.
+- Since Task 011 a step can also become `OUTCOME_UNKNOWN` because a terminal result was observed for a prepared dispatch that has no authorization. That closes this gate for the whole mission and for that dispatch for good. Recording evidence never consumes or refunds an attempt.
 
 The concepts below are the longer-term minimum. Only the parts listed above are implemented.
 
@@ -737,6 +754,7 @@ These should be resolved by implementation evidence rather than speculation:
 8. Minimum supported ROS 2 distributions beyond Jazzy.
 9. ~~Final licensing choice.~~ Resolved: Apache-2.0.
 10. Which failure semantics belong in the generic core versus the Nav2 adapter.
+11. Mission-level, evidence-backed reconciliation. `NEEDS_RECONCILIATION` has no exit, so evidence can settle the steps of such a mission and nothing can move the mission on. This is the follow-up of Task 011 (Task 012).
 
 ## 22. Milestones
 
@@ -752,7 +770,9 @@ Phase 1 (section 16) is the current milestone. It proceeds in bounded tasks:
 - Task 007, reconciliation decision model: **COMPLETE**. A pure decision function (`task_resilience/reconciliation.py`) that says what one recovery observation can establish about a dispatch. It changes no state and never authorizes a send (`docs/reconciliation_decision_model.md`).
 - Task 008, atomic send authorization and attempt semantics: **COMPLETE**. One attempt is one committed authorization to send one external step request, and `MissionStore.authorize_step_send` is the only way to take one and the only way to enter `DISPATCHED`. No schema change (version 3). See `docs/send_authorization_model.md`.
 - Task 009, immutable durable dispatch action context: **COMPLETE**. The action name, type and robot namespace a dispatch is declared to reach are bound to it, together with its UUID and `DISPATCH_PREPARED`, in one transaction (schema version 4, one new table). Declared intent, not proof of where a request was sent. `authorize_step_send` requires a bound context. No evidence is stored and no reconciliation is applied. See `docs/dispatch_context_model.md`.
-- Task 010, durable send-authorization provenance: **COMPLETE**. `authorize_step_send` now commits, in one transaction, the attempt, one row in the new `dispatch_authorizations` table (the dispatch and the store's authorization time) and `DISPATCHED` (schema version 5, one new table). Under the supported-store contract the row means only that `authorize_step_send` committed the authorization (the table is not tamper-evident): not that a request was sent, and not a permission. The attempt number is not stored. Migration creates no row for an earlier dispatch, and no row is not proof that nothing was authorized. No evidence is stored and no reconciliation is applied: terminal recovery evidence and its application are Task 011. See `docs/dispatch_authorization_model.md`.
+- Task 010, durable send-authorization provenance: **COMPLETE**. `authorize_step_send` now commits, in one transaction, the attempt, one row in the new `dispatch_authorizations` table (the dispatch and the store's authorization time) and `DISPATCHED` (schema version 5, one new table). Under the supported-store contract the row means only that `authorize_step_send` committed the authorization (the table is not tamper-evident): not that a request was sent, and not a permission. The attempt number is not stored. Migration creates no row for an earlier dispatch, and no row is not proof that nothing was authorized. No evidence is stored in that table and no reconciliation is applied by that task: terminal recovery evidence and its application are Task 011. See `docs/dispatch_authorization_model.md`.
+- Task 011, durable terminal recovery evidence and atomic evidence-backed step-state application: **COMPLETE**. `MissionStore.apply_recovery_observation` records a terminal `RESULT_RESPONSE` in the new `recovery_evidence` table (schema version 6, one new table) and applies it to the step through Task 007's decision, but only when the dispatch has Task 010 authorization provenance. Without it the evidence is recorded as `UNPROVEN_AUTHORIZATION` and not applied, a prepared step that is seen to finish becomes `OUTCOME_UNKNOWN` through the existing ordinary edge so the supported path can no longer authorize it, and an unknown step with no provenance is held. Evidence IDs bind to one observation for good, different IDs are distinct corroborating rows, `result_code` is kept exactly as canonical hexadecimal, and a message is kept as a bounded prefix with its exact size and SHA-256 (a content identity only). No mission row or attempt is ever written. See `docs/recovery_evidence_model.md`.
+- Task 012, mission-level evidence-backed reconciliation: **NEXT, NOT STARTED**. In particular `NEEDS_RECONCILIATION` has no exit. The ROS adapter and supervisor come after that, unless a review finds a better sequence.
 
 ### M0: Hardware-Free Nav2 Baseline — COMPLETE
 

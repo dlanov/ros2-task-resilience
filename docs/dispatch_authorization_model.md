@@ -247,7 +247,10 @@ only two: authorization first, so the step is unknown **with** its row and one a
 move to unknown first, so it is unknown **without** a row and the authorization is refused with no
 attempt taken.
 
-Neither line above is a recovery decision. Task 010 does not read the row for any decision, and it
+Neither line above is a recovery decision. Task 010 does not read the row for any decision. Task 011
+does (`docs/recovery_evidence_model.md`): it applies a terminal result to an `OUTCOME_UNKNOWN` step only
+when the row is there, and holds the step, with the evidence recorded as `UNPROVEN_AUTHORIZATION`, when it
+is not. Task 010 itself still does not read the row for any decision, and it
 does not change what an unknown step may do.
 
 ## Crashes and concurrency
@@ -276,11 +279,11 @@ query ROS, build a `RecoveryObservation`, call `decide_reconciliation`, apply a 
 outcome, or change any mission or step state. `authorizes_send` on a decision stays `False`, and no row
 authorizes anything.
 
-Task 011 is expected to add terminal recovery evidence and its application to a step's state. It will
-have to read a missing row conservatively, as "no proof", and that is not designed or implemented here.
-It may rely on a present row under the same trusted-store assumption: the row is not tamper-evident,
-and no authentication mechanism is added here.
+Task 011 has since added terminal recovery evidence and its application to a step's state. It reads a
+missing row conservatively, as "no proof" and not as proof that nothing was authorized: the evidence is
+recorded and not applied, and it invents no row. It relies on a present row under the same trusted-store
+assumption: the row is not tamper-evident, and no authentication mechanism is added. This table still
+stores no evidence.
 
-Not decided here: how evidence is stored or applied; what a missing row means for recovery; any
-mission-level consequence; whether an explicit legacy or operator-attestation mechanism should exist
+Not decided here: any mission-level consequence; whether an explicit legacy or operator-attestation mechanism should exist
 for dispatches authorized before version 5; retries; leases and fencing; the ROS adapter.

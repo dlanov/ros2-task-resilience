@@ -7,7 +7,8 @@ dispatch was expected to reach, and one recovery observation, and says what that
 
 This is a decision model only. It reads three immutable values and returns an immutable
 assessment. It writes nothing, sends nothing, changes no state, applies no reconciliation, and
-never authorizes a resend. Nothing calls it yet.
+never authorizes a resend. Since Task 011, `MissionStore.apply_recovery_observation` calls it from
+storage (`docs/recovery_evidence_model.md`). The function is unchanged and still pure.
 
 ## Observation versus inference
 
@@ -56,7 +57,8 @@ that has a dispatch) is the store's invariant. It is not checked here.
 This model takes them as input and is not allowed to guess them. Schema version 3 did not persist
 them. Since Task 009 (schema version 4) they are bound to each dispatch when it is first prepared
 (`docs/dispatch_context_model.md`); a dispatch that predates version 4 has none, and none is added
-later. Nothing here reads the store: a later task is expected to build this type from that binding. Nothing is normalized or inferred: `/robot1` and `robot1` differ, and so
+later. Nothing here reads the store. Since Task 011 the store builds this type from that binding, for every
+observation it records. Nothing is normalized or inferred: `/robot1` and `robot1` differ, and so
 do `''` and `/`. `action_name` and `action_type` must be non-empty. An empty `robot_namespace`
 is accepted as an exact value; whether it means the root namespace is the caller's convention.
 
@@ -182,10 +184,14 @@ report maps to.
 ## A candidate is not state application
 
 Nothing here writes to the store, and a decision has no method that could. Applying a candidate
-will need a separately reviewed path that re-reads the durable state inside a write transaction
-(the snapshot may be stale), verifies the evidence, records it durably, and decides the mission
-level consequences. None of that exists yet, and the ordinary state graph intentionally blocks
-the edges such a path would need.
+takes a separately reviewed path that re-reads the durable state inside a write transaction (the
+snapshot may be stale), verifies the evidence, records it durably, and decides the consequences.
+Task 011 is that path for the step (`docs/recovery_evidence_model.md`): the store builds the snapshot
+and the context, asks this module what the observation establishes, and applies a candidate only when
+the dispatch has durable authorization provenance, which the decision cannot know. The mission-level
+consequences are not decided there either. The ordinary state graph still blocks the edges that path
+needs, and it still does: applying to an `OUTCOME_UNKNOWN` step is a dedicated evidence-only write,
+not an edge.
 
 ## Why `authorizes_send` is always `False`
 
@@ -235,8 +241,12 @@ mission transition. This model is unchanged and still calls nothing.
 
 Task 010 has since added schema version 5 with one durable record per dispatch that supported code
 committed a send authorization for it (`docs/dispatch_authorization_model.md`). It stores no
-evidence either, and applies no reconciliation state. Storing terminal evidence and applying it to a
-step's state are expected in Task 011.
+evidence either, and applies no reconciliation state.
+
+Task 011 has since added schema version 6 with one durable table of terminal recovery evidence, and the
+atomic application of a terminal result to a step's state, through this model and gated by that
+provenance. This model is unchanged. Mission-level reconciliation is not done there: it is left to a
+later task, because `NEEDS_RECONCILIATION` still has no exit.
 
 Also not done: mapping ROS messages onto observations (an adapter), any notion of time, freshness
 or server epoch, and a policy for resolving an `EVIDENCE_CONFLICT`.

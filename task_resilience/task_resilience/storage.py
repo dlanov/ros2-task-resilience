@@ -16,6 +16,7 @@ from collections.abc import Iterable, Iterator
 import contextlib
 from datetime import datetime, timedelta, timezone
 import enum
+import hashlib
 import json
 import os
 import sqlite3
@@ -27,16 +28,20 @@ from .errors import (
     CorruptDispatchAuthorization,
     CorruptDispatchContext,
     CorruptDispatchRecord,
+    CorruptRecoveryEvidence,
     CorruptStoredState,
     DispatchAuthorizationMissing,
     DispatchContextConflict,
     DispatchContextMissing,
     DispatchNotFound,
     DispatchPreparationRequired,
+    EvidenceIdConflict,
+    EvidenceNotCorrelated,
     IdempotencyConflict,
     MissionNotFound,
     MissionNotRunning,
     MissionReconciliationRequired,
+    ObservationNotRecordable,
     SendAuthorizationRequired,
     StepDefinitionConflict,
     StepNotAwaitingSend,
@@ -47,16 +52,28 @@ from .model import (
     DispatchAuthorizationRecord,
     DispatchContextRecord,
     DispatchRecord,
+    EvidenceOutcome,
+    MESSAGE_PREFIX_MAX_BYTES,
     MissionRecord,
     MissionRequest,
+    RecoveryEvidenceRecord,
     SendAuthorization,
     StepRecord,
+    TERMINAL_RESULT_STATUSES,
     validate_step_keys,
 )
-from .reconciliation import ExpectedActionContext
+from .reconciliation import (
+    ActionStatus,
+    decide_reconciliation,
+    DecisionKind,
+    DurableSnapshot,
+    ExpectedActionContext,
+    ObservationKind,
+    RecoveryObservation,
+)
 from .state_machine import MissionState, StepState, transition_mission, transition_step
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _State = TypeVar('_State', bound=enum.Enum)
 
@@ -160,6 +177,67 @@ CREATE TABLE dispatch_authorizations (
 )
 """
 
+# One row per recorded terminal observation, keyed by the caller's evidence_id, which binds to
+# exactly one observation for good. A row durably records a terminal RESULT_RESPONSE that was
+# supplied to apply_recovery_observation and correlated with this dispatch's durable action
+# context. Under the future adapter contract that observation is expected to come from an action
+# server's result response, but MissionStore does not authenticate or independently verify where
+# it came from. A row does not say the step was changed (outcome says that) and it is not
+# permission to do anything. The primary key gives one row per ID. It does not make a row
+# immutable: only apply_recovery_observation inserts one, and no code updates or deletes one. The
+# table is not tamper-evident: a writer that bypasses the code can forge or alter even a
+# well-formed row, and such writes are outside the contract. result_code is opaque and is kept as
+# canonical hexadecimal text, because an INTEGER column cannot hold every integer Task 007
+# accepts. Of the message only a bounded prefix is kept, with its whole length and the SHA-256 of
+# the whole message. The digest is a compact content identity, used to distinguish message
+# contents and to detect changed replay content. It is not authentication, tamper evidence, a
+# proof of uniqueness or authorization provenance. recorded_at is this store's own wall-clock
+# time.
+_RECOVERY_EVIDENCE_DDL = """
+CREATE TABLE recovery_evidence (
+    evidence_id           TEXT NOT NULL PRIMARY KEY,
+    dispatch_id           TEXT NOT NULL
+                          REFERENCES step_dispatches (dispatch_id) ON DELETE CASCADE,
+    observed_status       TEXT NOT NULL CHECK (
+        observed_status IN ('SUCCEEDED', 'CANCELED', 'ABORTED')
+    ),
+    result_code           TEXT,
+    result_message_prefix BLOB,
+    result_message_bytes  INTEGER,
+    result_message_sha256 BLOB,
+    step_state_before     TEXT NOT NULL CHECK (step_state_before IN (
+        'DISPATCH_PREPARED',
+        'DISPATCHED',
+        'ACCEPTED',
+        'EXECUTING',
+        'SUCCEEDED',
+        'FAILED',
+        'CANCEL_REQUESTED',
+        'CANCELLED',
+        'OUTCOME_UNKNOWN'
+    )),
+    outcome               TEXT NOT NULL CHECK (outcome IN (
+        'APPLIED',
+        'ALREADY_SETTLED',
+        'CONFLICT',
+        'UNPROVEN_AUTHORIZATION'
+    )),
+    recorded_at           TEXT NOT NULL,
+    CHECK (
+        (result_message_prefix IS NULL
+         AND result_message_bytes IS NULL
+         AND result_message_sha256 IS NULL)
+        OR
+        (typeof(result_message_prefix) = 'blob'
+         AND typeof(result_message_bytes) = 'integer'
+         AND result_message_bytes >= length(result_message_prefix)
+         AND length(result_message_prefix) <= 1024
+         AND typeof(result_message_sha256) = 'blob'
+         AND length(result_message_sha256) = 32)
+    )
+)
+"""
+
 _RENAME_V1_MISSIONS = 'ALTER TABLE missions RENAME TO missions_v1'
 
 _COPY_V1_MISSIONS = """
@@ -237,6 +315,21 @@ _AUTHORIZATION_OF_DISPATCH = 'SELECT * FROM dispatch_authorizations WHERE dispat
 _INSERT_AUTHORIZATION = """
 INSERT INTO dispatch_authorizations (dispatch_id, authorized_at)
 VALUES (?, ?)
+"""
+
+_EVIDENCE_BY_ID = 'SELECT * FROM recovery_evidence WHERE evidence_id = ?'
+
+# ORDER BY evidence_id is deterministic and nothing more: it is not chronological, and neither is
+# recorded_at, a wall clock. The rowid is not part of any contract.
+_EVIDENCE_OF_DISPATCH = (
+    'SELECT * FROM recovery_evidence WHERE dispatch_id = ? ORDER BY evidence_id')
+
+# The only statement that writes recovery_evidence, and only apply_recovery_observation runs it.
+_INSERT_EVIDENCE = """
+INSERT INTO recovery_evidence (
+    evidence_id, dispatch_id, observed_status, result_code, result_message_prefix,
+    result_message_bytes, result_message_sha256, step_state_before, outcome, recorded_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -347,6 +440,108 @@ def _to_authorization(
         step_key=dispatch.step_key,
         authorized_at=parsed,
     )
+
+
+def _canonical_uuid(stored: object) -> uuid.UUID | None:
+    # Only the canonical text this code writes is accepted, as for a dispatch ID.
+    try:
+        parsed = uuid.UUID(stored)
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return parsed if str(parsed) == stored else None
+
+
+def _message_prefix(message: str) -> bytes:
+    # Walk whole characters, so a character is never split. Slicing the encoded bytes and
+    # dropping what is left over would silently lose a partial character.
+    kept = []
+    used = 0
+    for character in message:
+        encoded = character.encode('utf-8', 'surrogatepass')
+        if used + len(encoded) > MESSAGE_PREFIX_MAX_BYTES:
+            break
+        kept.append(encoded)
+        used += len(encoded)
+    return b''.join(kept)
+
+
+def _message_facts(message: str | None) -> tuple[bytes | None, int | None, bytes | None]:
+    # surrogatepass, so that any Python string round-trips, a lone surrogate included.
+    if message is None:
+        return None, None, None
+    whole = message.encode('utf-8', 'surrogatepass')
+    return _message_prefix(message), len(whole), hashlib.sha256(whole).digest()
+
+
+def _to_evidence(row: sqlite3.Row, dispatch: DispatchRecord) -> RecoveryEvidenceRecord:
+    # A row that is not a valid record fails loudly and is never repaired.
+    stored_id = row['evidence_id']
+
+    def corrupt(reason: str, value: object = None) -> CorruptRecoveryEvidence:
+        return CorruptRecoveryEvidence(
+            dispatch.mission_id, dispatch.step_key, stored_id, reason, value)
+
+    evidence_id = _canonical_uuid(stored_id)
+    if evidence_id is None:
+        raise corrupt('evidence_id is not a canonical UUID', stored_id)
+    # Every caller has already chosen the row by this dispatch, so its dispatch_id is not read.
+    try:
+        status = ActionStatus(row['observed_status'])
+        before = StepState(row['step_state_before'])
+        outcome = EvidenceOutcome(row['outcome'])
+    except ValueError:
+        raise corrupt('status, state or outcome is not a known value') from None
+
+    stored_code = row['result_code']
+    code = None
+    if stored_code is not None:
+        try:
+            code = int(stored_code, 16) if isinstance(stored_code, str) else None
+        except ValueError:
+            code = None
+        if code is None or hex(code) != stored_code:
+            raise corrupt('result_code is not a canonical hexadecimal integer', stored_code)
+
+    stored_prefix = row['result_message_prefix']
+    prefix = None
+    if stored_prefix is not None:
+        if not isinstance(stored_prefix, bytes):
+            raise corrupt('result_message_prefix is not a blob', stored_prefix)
+        # Whatever decodes with surrogatepass encodes back to the same bytes, so there is no
+        # second canonical form to reject.
+        try:
+            prefix = stored_prefix.decode('utf-8', 'surrogatepass')
+        except UnicodeDecodeError:
+            raise corrupt('result_message_prefix is not UTF-8', stored_prefix) from None
+
+    stored_time = row['recorded_at']
+    recorded_at = None
+    if isinstance(stored_time, str):
+        try:
+            recorded_at = datetime.fromisoformat(stored_time)
+        except ValueError:
+            pass
+    if (recorded_at is None or recorded_at.utcoffset() != timedelta(0)
+            or recorded_at.isoformat(timespec='microseconds') != stored_time):
+        raise corrupt('recorded_at is not a canonical UTC timestamp', stored_time)
+
+    try:
+        return RecoveryEvidenceRecord(
+            evidence_id=evidence_id,
+            dispatch_id=dispatch.dispatch_id,
+            mission_id=dispatch.mission_id,
+            step_key=dispatch.step_key,
+            observed_status=status,
+            result_code=code,
+            result_message_prefix=prefix,
+            result_message_bytes=row['result_message_bytes'],
+            result_message_sha256=row['result_message_sha256'],
+            step_state_before=before,
+            outcome=outcome,
+            recorded_at=recorded_at,
+        )
+    except (TypeError, ValueError) as error:
+        raise corrupt(str(error)) from None
 
 
 class MissionStore:
@@ -640,6 +835,146 @@ class MissionStore:
                 raise DispatchAuthorizationMissing(mission_id, step_key)
             return authorization
 
+    def apply_recovery_observation(
+        self, evidence_id: uuid.UUID, mission_id: str, step_key: str,
+        observation: RecoveryObservation,
+    ) -> RecoveryEvidenceRecord:
+        """
+        Record one terminal result response and apply what it establishes to the step.
+
+        Only a RESULT_RESPONSE with a terminal status is recordable; anything else raises
+        ObservationNotRecordable before a transaction is opened. Inside one transaction the store
+        reads the durable state and context, asks Task 007 what the observation establishes and
+        applies its own policy. An observation that does not correlate with the dispatch is
+        refused. Provenance gates application, not recording: without a durable authorization
+        row the evidence is recorded as UNPROVEN_AUTHORIZATION and the result is not applied,
+        except that a prepared step becomes OUTCOME_UNKNOWN so that authorize_step_send, the
+        supported path, can no longer authorize that dispatch. An unknown step with no such row
+        stays unknown. Absence of the row is no durable proof, not proof that nothing was
+        authorized. The store does not authenticate where the observation came from.
+
+        evidence_id belongs to exactly one observation for good. An exact replay returns the
+        stored record and writes nothing, after the durable state has been read and checked
+        again; a changed fact is EvidenceIdConflict. A different ID with the same facts is a
+        different, corroborating row. No attempt or mission row is touched, no send is
+        authorized and nothing external happens.
+        """
+        # Everything that needs no database comes first, so an observation that can never be
+        # recorded does not take the write lock.
+        if not isinstance(evidence_id, uuid.UUID):
+            raise TypeError(f'evidence_id must be a uuid.UUID, got {evidence_id!r}')
+        if not isinstance(observation, RecoveryObservation):
+            raise TypeError(f'observation must be a RecoveryObservation, got {observation!r}')
+        if observation.kind is not ObservationKind.RESULT_RESPONSE:
+            raise ObservationNotRecordable(
+                'only a result response can be recorded', observation.kind, observation.status)
+        if observation.status not in TERMINAL_RESULT_STATUSES:
+            raise ObservationNotRecordable(
+                'only a terminal result status can be recorded', observation.kind,
+                observation.status)
+        code_text = None if observation.result_code is None else hex(observation.result_code)
+        prefix, size, digest = _message_facts(observation.result_message)
+
+        with self._transaction():
+            mission = self._require(_BY_MISSION_ID, mission_id)
+            step = self._require_step(mission_id, step_key)
+            dispatch = self._fetch_dispatch(mission_id, step_key)
+            if dispatch is None:
+                # As the other writers do: a step that should have a dispatch and has none is
+                # corrupt, and one that never had one is simply not found.
+                if step.state in _IN_FLIGHT:
+                    raise CorruptDispatchRecord(
+                        mission_id, step_key, f'step is {step.state.value} but has no dispatch')
+                raise DispatchNotFound(mission_id=mission_id, step_key=step_key)
+
+            # The dispatch and its provenance are judged before the context, so that a pending
+            # step that has a dispatch stays a corruption of the dispatch record instead of
+            # being reported as a missing context. authorization is None when there is no row.
+            authorization = self._authorization_of(step, dispatch)
+            context = self._require_context(dispatch)
+
+            # Task 007 decides what the observation establishes. Nothing here maps a status to
+            # a step state: the candidate is read from the decision.
+            decision = decide_reconciliation(
+                DurableSnapshot(
+                    mission_state=mission.state, step_state=step.state,
+                    dispatch_id=dispatch.dispatch_id, mission_id=mission_id, step_key=step_key),
+                ExpectedActionContext(
+                    action_name=context.action_name, action_type=context.action_type,
+                    robot_namespace=context.robot_namespace),
+                observation)
+            if decision.kind is DecisionKind.UNCORRELATED:
+                raise EvidenceNotCorrelated(mission_id, step_key)
+            # Only these three kinds are about a recordable terminal result. Anything else is
+            # refused here, ahead of the ID lookup, so that no replay can get past it.
+            if decision.kind not in (
+                DecisionKind.TERMINAL_RESULT_CANDIDATE,
+                DecisionKind.ALREADY_SETTLED,
+                DecisionKind.EVIDENCE_CONFLICT,
+            ):
+                raise ObservationNotRecordable(
+                    f'unexpected decision {decision.kind.name}', observation.kind,
+                    observation.status)
+
+            # An exact replay returns what was stored, whatever the step is now, and only after
+            # everything above has been read and checked again.
+            row = self._conn.execute(_EVIDENCE_BY_ID, (str(evidence_id),)).fetchone()
+            if row is not None:
+                return self._replayed_evidence(
+                    row, evidence_id, dispatch, observation, (prefix, size, digest))
+
+            new_state = None
+            if decision.kind is DecisionKind.ALREADY_SETTLED:
+                outcome = EvidenceOutcome.ALREADY_SETTLED
+            elif decision.kind is DecisionKind.EVIDENCE_CONFLICT:
+                outcome = EvidenceOutcome.CONFLICT
+            else:
+                # A terminal result candidate: the guard above lets no other kind through.
+                if authorization is None:
+                    # No durable provenance: the result is kept and not applied. A prepared step
+                    # is the one exception, and only so that authorize_step_send, the supported
+                    # path, can no longer authorize a dispatch that a result has been observed
+                    # for. The edge is an ordinary one. An unknown step stays unknown, whatever
+                    # is observed later.
+                    outcome = EvidenceOutcome.UNPROVEN_AUTHORIZATION
+                    if step.state is StepState.DISPATCH_PREPARED:
+                        new_state = transition_step(step.state, StepState.OUTCOME_UNKNOWN)
+                else:
+                    outcome = EvidenceOutcome.APPLIED
+                    if step.state is StepState.OUTCOME_UNKNOWN:
+                        # The one way out of OUTCOME_UNKNOWN: a result with provenance. The
+                        # ordinary graph has no such edge and is not asked.
+                        new_state = decision.candidate_step_state
+                    else:
+                        new_state = transition_step(step.state, decision.candidate_step_state)
+
+            # The evidence first and the step last, in one transaction, with one timestamp.
+            now = _utc_now()
+            self._conn.execute(_INSERT_EVIDENCE, (
+                str(evidence_id), str(dispatch.dispatch_id), observation.status.value, code_text,
+                prefix, size, digest, step.state.value, outcome.value, now))
+            if new_state is not None:
+                self._conn.execute(_SET_STEP_STATE, (new_state.value, now, mission_id, step_key))
+
+            # The record is read back, so the caller gets exactly what is durable, and only when
+            # this block ends: if COMMIT fails, the caller gets that error and no record.
+            return _to_evidence(
+                self._conn.execute(_EVIDENCE_BY_ID, (str(evidence_id),)).fetchone(), dispatch)
+
+    def get_recovery_evidence(
+        self, mission_id: str, step_key: str,
+    ) -> tuple[RecoveryEvidenceRecord, ...]:
+        """
+        Return the evidence recorded for the step's dispatch. Never repairs or adds any.
+
+        The order is deterministic (by evidence ID) and is not chronological. A record is what
+        was observed when it was recorded: it says nothing about what state the step is in now.
+        """
+        self._require_step(mission_id, step_key)
+        dispatch = self._require_dispatch(mission_id, step_key)
+        rows = self._conn.execute(_EVIDENCE_OF_DISPATCH, (str(dispatch.dispatch_id),)).fetchall()
+        return tuple(_to_evidence(row, dispatch) for row in rows)
+
     @contextlib.contextmanager
     def _snapshot(self) -> Iterator[None]:
         # A deferred transaction for reads that must agree with each other. The first read
@@ -682,7 +1017,8 @@ class MissionStore:
                 self._conn.execute(_STEP_DISPATCHES_DDL)
                 self._conn.execute(_DISPATCH_CONTEXTS_DDL)
                 self._conn.execute(_DISPATCH_AUTHORIZATIONS_DDL)
-            elif version in (1, 2, 3, 4):
+                self._conn.execute(_RECOVERY_EVIDENCE_DDL)
+            elif version in (1, 2, 3, 4, 5):
                 # An older database goes through every step up to the current version inside
                 # this one transaction, so no version in between is ever committed.
                 if version == 1:
@@ -691,7 +1027,9 @@ class MissionStore:
                     self._migrate_v2_to_v3()
                 if version <= 3:
                     self._migrate_v3_to_v4()
-                self._migrate_v4_to_v5()
+                if version <= 4:
+                    self._migrate_v4_to_v5()
+                self._migrate_v5_to_v6()
             else:
                 raise UnsupportedSchemaVersion(version)
             self._conn.execute(f'PRAGMA user_version = {SCHEMA_VERSION}')
@@ -722,6 +1060,11 @@ class MissionStore:
         # progressed: whether an authorization was committed under version 4 cannot be told
         # from DISPATCHED, the attempt counter or a timestamp, so none is invented.
         self._conn.execute(_DISPATCH_AUTHORIZATIONS_DDL)
+
+    def _migrate_v5_to_v6(self) -> None:
+        # Only a table is added. No evidence is invented: nothing was observed before this
+        # table existed that could be recorded from what is already stored.
+        self._conn.execute(_RECOVERY_EVIDENCE_DDL)
 
     def _fetch(self, query: str, value: str) -> MissionRecord | None:
         row = self._conn.execute(query, (value,)).fetchone()
@@ -804,6 +1147,37 @@ class MissionStore:
         # Past DISPATCH_PREPARED a record is possible and its absence is not corruption: a
         # step that was authorized under schema version 4 has none.
         return authorization
+
+    def _replayed_evidence(
+        self, row: sqlite3.Row, evidence_id: uuid.UUID, dispatch: DispatchRecord,
+        observation: RecoveryObservation,
+        message: tuple[bytes | None, int | None, bytes | None],
+    ) -> RecoveryEvidenceRecord:
+        # Reads only. The ID belongs to what was stored: the same facts are a replay, anything
+        # else, or another dispatch, is a conflict. The outcome and the state before are the
+        # consequences of the first application and are not compared.
+        if row['dispatch_id'] != str(dispatch.dispatch_id):
+            if _canonical_uuid(row['dispatch_id']) is None:
+                raise CorruptRecoveryEvidence(
+                    dispatch.mission_id, dispatch.step_key, row['evidence_id'],
+                    'dispatch_id is not a canonical UUID', row['dispatch_id'])
+            raise EvidenceIdConflict(evidence_id)
+        stored = _to_evidence(row, dispatch)
+        prefix, size, digest = message
+        if (stored.observed_status is not observation.status
+                or stored.result_code != observation.result_code
+                or stored.result_message_bytes != size
+                or stored.result_message_sha256 != digest):
+            raise EvidenceIdConflict(evidence_id)
+        kept = (None if stored.result_message_prefix is None
+                else stored.result_message_prefix.encode('utf-8', 'surrogatepass'))
+        if kept != prefix:
+            # The digest and the length say it is the same message, so the prefix must be too.
+            raise CorruptRecoveryEvidence(
+                dispatch.mission_id, dispatch.step_key, row['evidence_id'],
+                'the stored prefix is not the prefix of the message its digest identifies',
+                row['result_message_prefix'])
+        return stored
 
     def _require_matching_context(
         self, dispatch: DispatchRecord, action: ExpectedActionContext,

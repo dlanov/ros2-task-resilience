@@ -88,7 +88,7 @@ KEYS = ['checkpoint_a', 'return_to_base']
 ROUNDS = 25
 TIMEOUT = 10
 
-# The tables as version 5 defines them, written out here so a new column or table shows up.
+# The tables as version 6 defines them, written out here so a new column or table shows up.
 COLUMNS = {
     'missions': [
         'mission_id', 'request_id', 'request_fingerprint', 'request_json', 'max_attempts',
@@ -100,8 +100,14 @@ COLUMNS = {
     'step_dispatches': ['dispatch_id', 'mission_id', 'step_key', 'created_at'],
     'dispatch_contexts': ['dispatch_id', 'action_name', 'action_type', 'robot_namespace'],
     'dispatch_authorizations': ['dispatch_id', 'authorized_at'],
+    'recovery_evidence': [
+        'evidence_id', 'dispatch_id', 'observed_status', 'result_code', 'result_message_prefix',
+        'result_message_bytes', 'result_message_sha256', 'step_state_before', 'outcome',
+        'recorded_at',
+    ],
 }
 V4_TABLES = ['missions', 'mission_steps', 'step_dispatches', 'dispatch_contexts']
+V5_TABLES = [*V4_TABLES, 'dispatch_authorizations']
 NEW_TABLE = 'dispatch_authorizations'
 
 # The two tables that version 4 and version 5 added, written out in full.
@@ -273,14 +279,17 @@ def file_digest(path):
 
 # A. The schema
 
-def test_the_schema_is_exactly_version_5_with_one_new_table(db_path):
+def test_the_schema_is_exactly_version_6_and_version_5_added_one_table(db_path):
     MissionStore(db_path).close()
 
-    assert storage.SCHEMA_VERSION == 5
-    assert raw(db_path, 'PRAGMA user_version') == [(5,)]
+    assert storage.SCHEMA_VERSION == 6
+    assert raw(db_path, 'PRAGMA user_version') == [(6,)]
     assert table_names(db_path) == set(COLUMNS)
-    assert len(COLUMNS) == len(V4_TABLES) + 1
-    assert set(COLUMNS) - set(V4_TABLES) == {NEW_TABLE}
+    # Version 5 added the authorization table to version 4's, and version 6 only the evidence
+    # table.
+    assert set(V5_TABLES) - set(V4_TABLES) == {NEW_TABLE}
+    assert len(COLUMNS) == len(V5_TABLES) + 1
+    assert set(COLUMNS) - set(V5_TABLES) == {'recovery_evidence'}
     for table, columns in COLUMNS.items():
         assert [row[1] for row in raw(db_path, f'PRAGMA table_info({table})')] == columns
 
@@ -333,8 +342,10 @@ def test_no_attempt_server_evidence_retry_or_ownership_field_is_stored(db_path, 
 
     stored = {name: sql for _, name, sql in schema_of(db_path)}
     assert word not in stored[NEW_TABLE].lower()
-    assert not [name for name in table_names(db_path)
-                if any(part in name for part in ('evidence', 'observation', 'reconcil'))]
+    # The authorization table stores no evidence. The one table named for evidence is Task 011's.
+    assert [name for name in table_names(db_path)
+            if any(part in name for part in ('evidence', 'observation', 'reconcil'))] == [
+        'recovery_evidence']
 
 
 def test_the_record_is_removed_with_its_dispatch_and_with_its_mission(store, db_path):
@@ -1271,18 +1282,31 @@ def make_v4_database(path):
         conn.execute('PRAGMA user_version = 4')
 
 
+def make_v5_database(path):
+    """Build a version 5 database: the version 4 fixture plus the empty authorization table."""
+    make_v4_database(path)
+    with contextlib.closing(sqlite3.connect(path, isolation_level=None)) as conn:
+        conn.execute(V5_DISPATCH_AUTHORIZATIONS_DDL)
+        conn.execute('PRAGMA user_version = 5')
+
+
 ORIGINS = {
     'v1': make_v1_database,
     'v2': make_v2_database,
     'v3': make_v3_database,
     'v4': make_v4_database,
+    'v5': make_v5_database,
 }
-VERSION_OF = {'v1': 1, 'v2': 2, 'v3': 3, 'v4': 4}
-MIGRATIONS = ['_migrate_v1_to_v2', '_migrate_v2_to_v3', '_migrate_v3_to_v4', '_migrate_v4_to_v5']
+VERSION_OF = {'v1': 1, 'v2': 2, 'v3': 3, 'v4': 4, 'v5': 5}
+MIGRATIONS = [
+    '_migrate_v1_to_v2', '_migrate_v2_to_v3', '_migrate_v3_to_v4', '_migrate_v4_to_v5',
+    '_migrate_v5_to_v6']
 
 
 def old_rows(path, origin):
     """Return every row the older version held, over the columns that version had."""
+    if origin == 'v5':
+        return dump(path, V5_TABLES)
     if origin == 'v4':
         return dump(path, V4_TABLES)
     return legacy_rows(path, origin)
@@ -1295,26 +1319,28 @@ def fresh_schema(tmp_path):
 
 
 @pytest.mark.parametrize('origin', list(ORIGINS))
-def test_every_older_database_migrates_to_version_5_and_invents_no_record(
+def test_every_older_database_migrates_to_version_6_and_invents_no_record(
         db_path, tmp_path, origin):
     ORIGINS[origin](db_path)
     before = old_rows(db_path, origin)
 
     MissionStore(db_path).close()
 
-    assert raw(db_path, 'PRAGMA user_version') == [(5,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(6,)]
     assert old_rows(db_path, origin) == before
     assert table_names(db_path) == set(COLUMNS)
     assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_authorizations') == [(0,)]
+    assert raw(db_path, 'SELECT COUNT(*) FROM recovery_evidence') == [(0,)]
     assert schema_of(db_path) == fresh_schema(tmp_path)
 
 
-def test_a_fresh_database_is_created_at_version_5_with_no_record(db_path):
+def test_a_fresh_database_is_created_at_version_6_with_no_record(db_path):
     MissionStore(db_path).close()
 
-    assert raw(db_path, 'PRAGMA user_version') == [(5,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(6,)]
     assert table_names(db_path) == set(COLUMNS)
     assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_authorizations') == [(0,)]
+    assert raw(db_path, 'SELECT COUNT(*) FROM recovery_evidence') == [(0,)]
 
 
 @pytest.mark.parametrize(('origin', 'expected'), [
@@ -1322,6 +1348,7 @@ def test_a_fresh_database_is_created_at_version_5_with_no_record(db_path):
     ('v2', MIGRATIONS[1:]),
     ('v3', MIGRATIONS[2:]),
     ('v4', MIGRATIONS[3:]),
+    ('v5', MIGRATIONS[4:]),
 ])
 def test_each_origin_runs_exactly_the_steps_after_its_own_version(
         monkeypatch, db_path, origin, expected):
@@ -1342,7 +1369,7 @@ def test_each_origin_runs_exactly_the_steps_after_its_own_version(
 
     MissionStore(db_path).close()
 
-    # A native version 4 database never goes through the version 3 step again.
+    # A native database never goes through a step that an older version already ran.
     assert called == expected
 
 
@@ -1357,7 +1384,8 @@ def test_a_current_or_fresh_database_runs_no_migration_step(monkeypatch, db_path
     assert called == []
 
 
-def test_the_version_4_migration_is_one_create_table_and_the_new_version(monkeypatch, db_path):
+def test_the_version_4_migration_is_two_create_tables_and_only_the_last_version(
+        monkeypatch, db_path):
     make_v4_database(db_path)
 
     store, connection = open_faulty_store(monkeypatch, db_path)
@@ -1365,15 +1393,20 @@ def test_the_version_4_migration_is_one_create_table_and_the_new_version(monkeyp
 
     statements = connection.statements
     changing = writes(statements)
-    assert len(changing) == 1 and changing[0].startswith('CREATE TABLE dispatch_authorizations (')
+    # The step to version 5 is still exactly one CREATE TABLE, and the step to version 6 one more.
+    assert len(changing) == 2
+    assert changing[0].startswith('CREATE TABLE dispatch_authorizations (')
+    assert changing[1].startswith('CREATE TABLE recovery_evidence (')
     # No table was rebuilt: nothing dropped, renamed, altered, copied or filled, and the
     # version 3 step, which would fail on a native version 4 database, was not run.
     assert not [sql for sql in statements if sql.split()[0] in ('ALTER', 'DROP', 'INSERT')]
     assert not [sql for sql in statements if sql.startswith('CREATE TABLE dispatch_contexts')]
     assert statements.count('BEGIN IMMEDIATE') == 1
     assert statements.count('COMMIT') == 1
-    assert statements.count('PRAGMA user_version = 5') == 1
-    assert statements.index(changing[0]) < statements.index('PRAGMA user_version = 5') < (
+    # Version 5 is never committed on the way.
+    assert 'PRAGMA user_version = 5' not in statements
+    assert statements.count('PRAGMA user_version = 6') == 1
+    assert statements.index(changing[1]) < statements.index('PRAGMA user_version = 6') < (
         statements.index('COMMIT'))
 
 
@@ -1388,7 +1421,7 @@ def test_reopening_a_migrated_database_changes_nothing(monkeypatch, db_path, ori
 
     assert writes(connection.statements) == []
     assert (dump(db_path), schema_of(db_path), file_digest(db_path)) == before
-    assert raw(db_path, 'PRAGMA user_version') == [(5,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(6,)]
 
 
 def test_concurrent_opens_of_a_version_4_database_migrate_it_once(tmp_path):
@@ -1407,9 +1440,10 @@ def test_concurrent_opens_of_a_version_4_database_migrate_it_once(tmp_path):
             for future in [pool.submit(open_and_close) for _ in range(workers)]:
                 future.result(timeout=TIMEOUT)
 
-        assert raw(path, 'PRAGMA user_version') == [(5,)]
+        assert raw(path, 'PRAGMA user_version') == [(6,)]
         assert dump(path, V4_TABLES) == before
         assert raw(path, 'SELECT COUNT(*) FROM dispatch_authorizations') == [(0,)]
+        assert raw(path, 'SELECT COUNT(*) FROM recovery_evidence') == [(0,)]
         fresh = tmp_path / f'fresh-{round_index}.db'
         MissionStore(fresh).close()
         assert schema_of(path) == schema_of(fresh)
@@ -1426,21 +1460,26 @@ def assert_still_version_4(db_path, before, schema):
         conn.execute('ROLLBACK')
 
 
-@pytest.mark.parametrize('failing', ['create the table', 'set the version', 'commit'])
+@pytest.mark.parametrize('failing', [
+    'create the authorization table', 'create the evidence table', 'set the version', 'commit'])
 def test_a_failure_while_migrating_from_version_4_rolls_back_cleanly(
         monkeypatch, db_path, failing):
     make_v4_database(db_path)
     before = dump(db_path, V4_TABLES)
     schema = schema_of(db_path)
 
-    if failing == 'create the table':
+    if failing.startswith('create'):
+        ddl = {
+            'create the authorization table': '_DISPATCH_AUTHORIZATIONS_DDL',
+            'create the evidence table': '_RECOVERY_EVIDENCE_DDL',
+        }[failing]
         with monkeypatch.context() as patch:
-            patch.setattr(storage, '_DISPATCH_AUTHORIZATIONS_DDL', 'THIS IS NOT SQL')
+            patch.setattr(storage, ddl, 'THIS IS NOT SQL')
             with pytest.raises(sqlite3.OperationalError):
                 MissionStore(db_path)
     else:
         fails = {
-            'set the version': lambda sql: sql.strip() == 'PRAGMA user_version = 5',
+            'set the version': lambda sql: sql.strip() == 'PRAGMA user_version = 6',
             'commit': lambda sql: sql.strip().upper() == 'COMMIT',
         }[failing]
         with pytest.raises(sqlite3.OperationalError, match='injected failure'):
@@ -1450,20 +1489,29 @@ def test_a_failure_while_migrating_from_version_4_rolls_back_cleanly(
     # A later, healthy open finishes the migration.
     with MissionStore(db_path):
         pass
-    assert raw(db_path, 'PRAGMA user_version') == [(5,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(6,)]
     assert dump(db_path, V4_TABLES) == before
     assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_authorizations') == [(0,)]
+    assert raw(db_path, 'SELECT COUNT(*) FROM recovery_evidence') == [(0,)]
 
 
-@pytest.mark.parametrize('origin', list(ORIGINS))
-def test_a_failure_at_the_last_step_leaves_every_older_database_at_its_own_version(
-        monkeypatch, db_path, origin):
+# Each origin with each of the two newest DDLs that its own chain still runs. A version 5 database
+# never creates the authorization table again, so breaking it there would break nothing.
+LATE_STEPS = [
+    (origin, ddl) for origin in ORIGINS
+    for ddl in ('_DISPATCH_AUTHORIZATIONS_DDL', '_RECOVERY_EVIDENCE_DDL')
+    if not (origin == 'v5' and ddl == '_DISPATCH_AUTHORIZATIONS_DDL')]
+
+
+@pytest.mark.parametrize(('origin', 'ddl'), LATE_STEPS)
+def test_a_failure_at_a_late_step_leaves_every_older_database_at_its_own_version(
+        monkeypatch, db_path, origin, ddl):
     ORIGINS[origin](db_path)
     before = old_rows(db_path, origin)
     schema = schema_of(db_path)
 
     with monkeypatch.context() as patch:
-        patch.setattr(storage, '_DISPATCH_AUTHORIZATIONS_DDL', 'THIS IS NOT SQL')
+        patch.setattr(storage, ddl, 'THIS IS NOT SQL')
         with pytest.raises(sqlite3.OperationalError):
             MissionStore(db_path)
 
@@ -2361,12 +2409,13 @@ def test_no_method_creates_repairs_backfills_or_attests_a_record():
 
     assert not [name for name in names if any(word in name.lower() for word in (
         'backfill', 'repair', 'attest', 'restore', 'grant', 'infer', 'reconstruct'))]
-    # The one new public operation is a read.
+    # Task 010 added one read. Task 011 has since added the write and the read of evidence, and
+    # nothing that writes an authorization record.
     assert sorted(name for name in names if not name.startswith('_')) == sorted([
-        'authorize_step_send', 'close', 'create_or_get', 'get_by_mission_id',
-        'get_by_request_id', 'get_dispatch', 'get_dispatch_authorization',
-        'get_dispatch_context', 'get_step', 'get_step_dispatch', 'get_steps',
-        'initialize_steps', 'prepare_step_dispatch', 'transition_mission_state',
+        'apply_recovery_observation', 'authorize_step_send', 'close', 'create_or_get',
+        'get_by_mission_id', 'get_by_request_id', 'get_dispatch', 'get_dispatch_authorization',
+        'get_dispatch_context', 'get_recovery_evidence', 'get_step', 'get_step_dispatch',
+        'get_steps', 'initialize_steps', 'prepare_step_dispatch', 'transition_mission_state',
         'transition_step_state'])
 
 

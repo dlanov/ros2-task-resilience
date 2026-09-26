@@ -83,12 +83,12 @@ def check_list(conn, table, column):
     return re.findall(r"'([^']*)'", match.group(1))
 
 
-def test_fresh_database_is_created_at_version_5(conn):
-    assert conn.execute('PRAGMA user_version').fetchone()[0] == 5
+def test_fresh_database_is_created_at_version_6(conn):
+    assert conn.execute('PRAGMA user_version').fetchone()[0] == 6
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert tables == {
         'missions', 'mission_steps', 'step_dispatches', 'dispatch_contexts',
-        'dispatch_authorizations',
+        'dispatch_authorizations', 'recovery_evidence',
     }
 
 
@@ -107,6 +107,14 @@ def test_step_dispatches_table_holds_only_the_identity(conn):
 
 def test_dispatch_authorizations_table_holds_only_the_dispatch_and_its_time(conn):
     assert columns(conn, 'dispatch_authorizations') == ['dispatch_id', 'authorized_at']
+
+
+def test_recovery_evidence_table_has_exactly_the_evidence_columns(conn):
+    assert columns(conn, 'recovery_evidence') == [
+        'evidence_id', 'dispatch_id', 'observed_status', 'result_code', 'result_message_prefix',
+        'result_message_bytes', 'result_message_sha256', 'step_state_before', 'outcome',
+        'recorded_at',
+    ]
 
 
 def test_mission_steps_table_holds_only_identity_order_and_state(conn):

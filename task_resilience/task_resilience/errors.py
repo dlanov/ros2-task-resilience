@@ -258,3 +258,53 @@ class CorruptDispatchAuthorization(Exception):
         self.step_key = step_key
         self.reason = reason
         self.value = value
+
+
+class ObservationNotRecordable(Exception):
+    """Only a terminal result response can be recorded as recovery evidence."""
+
+    # kind and status are typed as object on purpose: this module must not import reconciliation,
+    # which imports the state machine, which imports this module.
+    def __init__(self, reason: str, kind: object = None, status: object = None) -> None:
+        super().__init__(f'observation cannot be recorded: {reason}')
+        self.reason = reason
+        self.kind = kind
+        self.status = status
+
+
+class EvidenceNotCorrelated(Exception):
+    """The observation is not about this step's dispatch and action."""
+
+    def __init__(self, mission_id: str, step_key: str) -> None:
+        super().__init__(
+            f'observation does not correlate with the dispatch of step {step_key!r} of '
+            f'mission {mission_id!r}')
+        self.mission_id = mission_id
+        self.step_key = step_key
+
+
+class EvidenceIdConflict(Exception):
+    """An evidence ID was already recorded with different contents, or for another dispatch."""
+
+    def __init__(self, evidence_id: uuid.UUID) -> None:
+        super().__init__(
+            f'evidence_id {str(evidence_id)!r} was already recorded with different contents')
+        self.evidence_id = evidence_id
+
+
+class CorruptRecoveryEvidence(Exception):
+    """A stored recovery evidence row cannot be read as valid evidence."""
+
+    def __init__(
+        self, mission_id: str, step_key: str, evidence_id: object, reason: str,
+        value: object = None,
+    ) -> None:
+        super().__init__(
+            f'recovery evidence {evidence_id!r} of step {step_key!r} of mission '
+            f'{mission_id!r}: {reason}')
+        self.mission_id = mission_id
+        self.step_key = step_key
+        # The stored value, not a parsed one: an unreadable ID is itself a reason to raise this.
+        self.evidence_id = evidence_id
+        self.reason = reason
+        self.value = value

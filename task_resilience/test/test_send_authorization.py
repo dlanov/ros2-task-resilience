@@ -65,7 +65,7 @@ KEYS = ['checkpoint_a', 'return_to_base']
 ROUNDS = 25
 TIMEOUT = 10
 
-# The tables as version 5 defines them, written out here so a new column or table shows up.
+# The tables as version 6 defines them, written out here so a new column or table shows up.
 COLUMNS = {
     'missions': [
         'mission_id', 'request_id', 'request_fingerprint', 'request_json', 'max_attempts',
@@ -77,6 +77,11 @@ COLUMNS = {
     'step_dispatches': ['dispatch_id', 'mission_id', 'step_key', 'created_at'],
     'dispatch_contexts': ['dispatch_id', 'action_name', 'action_type', 'robot_namespace'],
     'dispatch_authorizations': ['dispatch_id', 'authorized_at'],
+    'recovery_evidence': [
+        'evidence_id', 'dispatch_id', 'observed_status', 'result_code', 'result_message_prefix',
+        'result_message_bytes', 'result_message_sha256', 'step_state_before', 'outcome',
+        'recorded_at',
+    ],
 }
 
 # The one table that a committed authorization adds a row to. No other table gains or loses one.
@@ -608,6 +613,7 @@ def test_a_migrated_prepared_step_without_an_identity_cannot_be_authorized(db_pa
     with contextlib.closing(sqlite3.connect(db_path, isolation_level=None)) as conn:
         conn.execute("UPDATE mission_steps SET step_state = 'DISPATCH_PREPARED'"
                      " WHERE step_key = 'checkpoint_a'")
+        conn.execute('DROP TABLE recovery_evidence')
         conn.execute('DROP TABLE dispatch_authorizations')
         conn.execute('DROP TABLE dispatch_contexts')
         conn.execute('DROP TABLE step_dispatches')
@@ -620,10 +626,11 @@ def test_a_migrated_prepared_step_without_an_identity_cannot_be_authorized(db_pa
 
         assert 'DISPATCH_PREPARED' in excinfo.value.reason
         assert dump(db_path) == before
-    assert raw(db_path, 'PRAGMA user_version') == [(5,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(6,)]
     assert raw(db_path, 'SELECT COUNT(*) FROM step_dispatches') == [(0,)]
     assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_contexts') == [(0,)]
     assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_authorizations') == [(0,)]
+    assert raw(db_path, 'SELECT COUNT(*) FROM recovery_evidence') == [(0,)]
 
 
 # Direct entry to DISPATCHED
@@ -1250,11 +1257,11 @@ def test_importing_the_store_loads_no_ros_network_or_llm_package():
     assert child.stdout.strip() == '[]'
 
 
-def test_the_schema_is_version_5_with_exactly_the_expected_tables_and_columns(db_path):
+def test_the_schema_is_version_6_with_exactly_the_expected_tables_and_columns(db_path):
     MissionStore(db_path).close()
 
-    assert storage.SCHEMA_VERSION == 5
-    assert raw(db_path, 'PRAGMA user_version') == [(5,)]
+    assert storage.SCHEMA_VERSION == 6
+    assert raw(db_path, 'PRAGMA user_version') == [(6,)]
     tables = {name for (name,) in raw(
         db_path, "SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert tables == set(COLUMNS)

@@ -261,9 +261,11 @@ Task 009 stores the declared context. It does **not** query ROS, construct a
 `RecoveryObservation`, call `decide_reconciliation`, record evidence, or apply a terminal outcome,
 and `authorizes_send` on a decision stays `False`. Task 010 has since added the durable record that
 supported code committed a send authorization for a dispatch (`docs/dispatch_authorization_model.md`),
-and it does not touch the context. Task 011 is expected to build Task 007's `ExpectedActionContext`
-from this durable binding and compare recovery observations against it.
+and it does not touch the context. Task 011 has since built Task 007's `ExpectedActionContext` from this
+durable binding and compares recovery observations against it before recording anything
+(`docs/recovery_evidence_model.md`). A dispatch with no context takes no evidence at all: it fails with
+`DispatchContextMissing`, and nothing is stored. Task 011 changes nothing about how a context is bound.
 
-Not decided here: how evidence is stored or applied; any mission-level consequence; whether an
+Not decided here: any mission-level consequence of recorded evidence; whether an
 explicit legacy or operator-attestation mechanism should exist for a dispatch that has no context;
 retries; goal-body binding; leases and fencing; the ROS adapter.

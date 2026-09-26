@@ -15,6 +15,7 @@
 from collections.abc import Iterable
 from dataclasses import dataclass, field, InitVar
 from datetime import datetime, timedelta
+import enum
 import hashlib
 import json
 import math
@@ -22,7 +23,20 @@ from typing import Any
 import uuid
 
 from .errors import InvalidRequest
-from .state_machine import MissionState, StepState
+from .reconciliation import ActionStatus
+from .state_machine import is_step_terminal, MissionState, StepState
+
+# The most of a result message that is kept. The rest of it is represented by its length and its
+# SHA-256, a compact content identity that is not a proof of uniqueness.
+MESSAGE_PREFIX_MAX_BYTES = 1024
+
+# The only result statuses that are a terminal outcome, and so the only ones recorded as evidence.
+# This is a list of statuses, not a mapping: which step state a status means is Task 007's to say.
+TERMINAL_RESULT_STATUSES = frozenset({
+    ActionStatus.SUCCEEDED,
+    ActionStatus.CANCELED,
+    ActionStatus.ABORTED,
+})
 
 
 def _check_json(value: Any, path: str, active: set[int]) -> None:
@@ -239,6 +253,147 @@ class SendAuthorization:
             raise TypeError(f'authorized_at must be a datetime, got {self.authorized_at!r}')
         if self.authorized_at.utcoffset() != timedelta(0):
             raise ValueError('authorized_at must be a timezone-aware UTC datetime')
+
+
+@enum.unique
+class EvidenceOutcome(enum.Enum):
+    """What recording one piece of evidence did. The values are persisted: do not change them."""
+
+    # The step was moved to the terminal state the result maps to.
+    APPLIED = 'APPLIED'
+    # The result matches the terminal state the step already had. Nothing changed.
+    ALREADY_SETTLED = 'ALREADY_SETTLED'
+    # The result contradicts the terminal state the step already had. Nothing changed.
+    CONFLICT = 'CONFLICT'
+    # The result could have settled the step, but the dispatch has no durable authorization
+    # provenance, so it was withheld. That is not proof that no authorization happened.
+    UNPROVEN_AUTHORIZATION = 'UNPROVEN_AUTHORIZATION'
+
+
+# The step states a result can settle, and so the only ones a result can be APPLIED to. A prepared
+# step has no authorization, and a step that is already terminal is not settled again.
+_APPLICABLE_FROM = frozenset({
+    StepState.DISPATCHED,
+    StepState.ACCEPTED,
+    StepState.EXECUTING,
+    StepState.CANCEL_REQUESTED,
+    StepState.OUTCOME_UNKNOWN,
+})
+
+
+@dataclass(frozen=True)
+class RecoveryEvidenceRecord:
+    """
+    A terminal result response that was supplied to the store, as it was recorded.
+
+    A row durably records a terminal RESULT_RESPONSE supplied to apply_recovery_observation and
+    successfully correlated with this dispatch's durable action context. Under the future adapter
+    contract, that observation is expected to come from an action-server result response.
+    MissionStore itself does not authenticate or independently verify the observation's external
+    origin. A row is not proof that the physical task happened, and it is not by itself a change
+    to the step: outcome says what recording it did. The table is not tamper-evident: a writer
+    that bypasses MissionStore can forge or alter even a well-formed row, and such writes are
+    outside the supported contract.
+
+    result_code is opaque and is never interpreted; 0 is not success. Only a bounded prefix of
+    the message is kept, with its full length in bytes and the SHA-256 of the whole message. The
+    digest is a compact content identity, used to distinguish message contents and to detect
+    changed replay content. It is not authentication, tamper evidence, a proof of uniqueness or
+    authorization provenance. recorded_at is this store's own wall-clock time, not a server or
+    observation time.
+    """
+
+    evidence_id: uuid.UUID
+    dispatch_id: uuid.UUID
+    mission_id: str
+    step_key: str
+    observed_status: ActionStatus
+    result_code: int | None
+    result_message_prefix: str | None
+    result_message_bytes: int | None
+    result_message_sha256: bytes | None
+    step_state_before: StepState
+    outcome: EvidenceOutcome
+    recorded_at: datetime
+
+    def __post_init__(self) -> None:
+        for name in ('evidence_id', 'dispatch_id'):
+            if not isinstance(getattr(self, name), uuid.UUID):
+                raise TypeError(f'{name} must be a uuid.UUID, got {getattr(self, name)!r}')
+        if not isinstance(self.mission_id, str) or not isinstance(self.step_key, str):
+            raise TypeError('mission_id and step_key must be strings')
+        if not self.mission_id or not self.step_key:
+            raise ValueError('mission_id and step_key must not be empty')
+        if not isinstance(self.observed_status, ActionStatus):
+            raise TypeError(
+                f'observed_status must be an ActionStatus, got {self.observed_status!r}')
+        if self.observed_status not in TERMINAL_RESULT_STATUSES:
+            raise ValueError(f'{self.observed_status.name} is not a terminal result status')
+        # bool is an int subclass, but True is not a result code.
+        if self.result_code is not None and (
+                isinstance(self.result_code, bool) or not isinstance(self.result_code, int)):
+            raise TypeError(f'result_code must be an int or None, got {self.result_code!r}')
+        self._check_message()
+        if not isinstance(self.step_state_before, StepState):
+            raise TypeError(
+                f'step_state_before must be a StepState, got {self.step_state_before!r}')
+        if self.step_state_before is StepState.PENDING:
+            raise ValueError('a pending step has no dispatch, so there is nothing to record')
+        if not isinstance(self.outcome, EvidenceOutcome):
+            raise TypeError(f'outcome must be an EvidenceOutcome, got {self.outcome!r}')
+        self._check_outcome()
+        if not isinstance(self.recorded_at, datetime):
+            raise TypeError(f'recorded_at must be a datetime, got {self.recorded_at!r}')
+        if self.recorded_at.utcoffset() != timedelta(0):
+            raise ValueError('recorded_at must be a timezone-aware UTC datetime')
+
+    def _check_message(self) -> None:
+        fields = (
+            self.result_message_prefix, self.result_message_bytes, self.result_message_sha256)
+        if all(field is None for field in fields):
+            return
+        if any(field is None for field in fields):
+            raise ValueError('the result message prefix, size and SHA-256 are all set or all None')
+        prefix, size, digest = fields
+        if not isinstance(prefix, str):
+            raise TypeError(f'result_message_prefix must be a str, got {prefix!r}')
+        if isinstance(size, bool) or not isinstance(size, int):
+            raise TypeError(f'result_message_bytes must be an int, got {size!r}')
+        if not isinstance(digest, bytes):
+            raise TypeError(f'result_message_sha256 must be bytes, got {digest!r}')
+        if len(digest) != 32:
+            raise ValueError('result_message_sha256 must be 32 bytes')
+        kept = prefix.encode('utf-8', 'surrogatepass')
+        if len(kept) > MESSAGE_PREFIX_MAX_BYTES:
+            raise ValueError(f'the message prefix is more than {MESSAGE_PREFIX_MAX_BYTES} bytes')
+        if size < len(kept):
+            raise ValueError('the message is shorter than its own prefix')
+        if size == len(kept):
+            # Nothing was cut, so the prefix is the whole message and must hash to the digest.
+            if hashlib.sha256(kept).digest() != digest:
+                raise ValueError('the message SHA-256 does not match a message that was not cut')
+        elif len(kept) <= MESSAGE_PREFIX_MAX_BYTES - 4:
+            # A character is at most four bytes, so a cut prefix stops within three bytes of the
+            # bound.
+            raise ValueError('a prefix that was cut is shorter than the bound allows')
+
+    def _check_outcome(self) -> None:
+        before, outcome = self.step_state_before, self.outcome
+        if outcome in (EvidenceOutcome.ALREADY_SETTLED, EvidenceOutcome.CONFLICT):
+            if not is_step_terminal(before):
+                raise ValueError(f'{outcome.name} needs a step that was already terminal')
+        elif is_step_terminal(before):
+            raise ValueError(f'{outcome.name} needs a step that was not terminal')
+        if outcome is EvidenceOutcome.APPLIED and before not in _APPLICABLE_FROM:
+            raise ValueError(f'a result cannot be applied to a step that was {before.value}')
+
+    @property
+    def result_message_truncated(self) -> bool:
+        """Return whether the kept prefix is shorter than the message that was observed."""
+        if self.result_message_prefix is None:
+            return False
+        return self.result_message_bytes > len(
+            self.result_message_prefix.encode('utf-8', 'surrogatepass'))
 
 
 def validate_step_keys(step_keys: Iterable[str]) -> tuple[str, ...]:
