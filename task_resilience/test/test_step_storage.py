@@ -22,7 +22,7 @@ from task_resilience.errors import (
     StepDefinitionConflict,
     StepNotFound,
 )
-from task_resilience.model import StepRecord
+from task_resilience.model import ExpectedGoalSpecification, StepRecord
 from task_resilience.reconciliation import ExpectedActionContext
 from task_resilience.state_machine import StepState
 from task_resilience.storage import MissionStore
@@ -31,6 +31,9 @@ from task_resilience.storage import MissionStore
 ACTION = ExpectedActionContext(
     action_name='/navigate_to_pose', action_type='nav2_msgs/action/NavigateToPose',
     robot_namespace='/robot1')
+
+GOAL = ExpectedGoalSpecification(
+    goal_format='test/goal/v1', payload={'target': 'checkpoint-a'})
 
 KEYS = ['checkpoint_a', 'return_to_base']
 
@@ -110,7 +113,7 @@ def test_identical_replay_returns_the_existing_rows(store, mission):
 
 def test_replay_does_not_reset_state_or_rewrite_timestamps(store, mission):
     store.initialize_steps(mission.mission_id, KEYS)
-    store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION)
+    store.prepare_step_dispatch(mission.mission_id, 'checkpoint_a', ACTION, GOAL)
     moved = store.get_step(mission.mission_id, 'checkpoint_a')
     before = store.get_steps(mission.mission_id)
 
@@ -228,7 +231,7 @@ def test_the_same_step_keys_can_be_used_by_different_missions(store):
     store.initialize_steps(first.mission_id, KEYS)
     store.initialize_steps(second.mission_id, KEYS)
 
-    store.prepare_step_dispatch(first.mission_id, 'checkpoint_a', ACTION)
+    store.prepare_step_dispatch(first.mission_id, 'checkpoint_a', ACTION, GOAL)
 
     assert store.get_step(first.mission_id, 'checkpoint_a').state is StepState.DISPATCH_PREPARED
     assert store.get_step(second.mission_id, 'checkpoint_a').state is StepState.PENDING

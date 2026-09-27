@@ -27,6 +27,7 @@ from .errors import (
     AttemptLimitReached,
     CorruptDispatchAuthorization,
     CorruptDispatchContext,
+    CorruptDispatchGoal,
     CorruptDispatchRecord,
     CorruptMissionReconciliationContext,
     CorruptRecoveryEvidence,
@@ -34,11 +35,14 @@ from .errors import (
     DispatchAuthorizationMissing,
     DispatchContextConflict,
     DispatchContextMissing,
+    DispatchGoalConflict,
+    DispatchGoalMissing,
     DispatchNotFound,
     DispatchPreparationRequired,
     EvidenceIdConflict,
     EvidenceNotCorrelated,
     IdempotencyConflict,
+    InvalidRequest,
     MissionNotAwaitingReconciliation,
     MissionNotFound,
     MissionNotRunning,
@@ -56,8 +60,10 @@ from .errors import (
 from .model import (
     DispatchAuthorizationRecord,
     DispatchContextRecord,
+    DispatchGoalRecord,
     DispatchRecord,
     EvidenceOutcome,
+    ExpectedGoalSpecification,
     MESSAGE_PREFIX_MAX_BYTES,
     MissionReconciliationContextRecord,
     MissionRecord,
@@ -85,7 +91,7 @@ from .state_machine import (
     transition_step,
 )
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _State = TypeVar('_State', bound=enum.Enum)
 
@@ -271,6 +277,29 @@ CREATE TABLE mission_reconciliation_contexts (
 )
 """
 
+# The exact external goal a dispatch is declared to carry, kept apart from dispatch_contexts for
+# the same reason that table is kept apart from step_dispatches: dispatch_contexts says WHERE a
+# dispatch is declared to reach, this says WHAT it is declared to carry, and neither is evidence
+# that anything was sent or executed. The primary key allows one row per dispatch. It does not
+# make a row immutable: only the first preparation of a step inserts a row, and no code updates,
+# replaces or deletes one. Nothing else stops a writer that bypasses the code. goal_format is
+# opaque to the store: a caller-chosen tag naming which adapter format/version goal_json means,
+# never interpreted here. goal_json is the canonical JSON text of the payload alone, analogous to
+# missions.request_json; goal_fingerprint is the SHA-256 of the COMPLETE specification
+# (goal_format together with the payload), analogous to missions.request_fingerprint: the
+# fingerprint covers both fields together. Replay equality is decided from exact goal_format and
+# canonical goal_json, never the fingerprint alone. No timestamp: the dispatch's own created_at,
+# in step_dispatches, is when this was bound, because binding is atomic with dispatch creation.
+_DISPATCH_GOALS_DDL = """
+CREATE TABLE dispatch_goals (
+    dispatch_id      TEXT NOT NULL PRIMARY KEY
+                     REFERENCES step_dispatches (dispatch_id) ON DELETE CASCADE,
+    goal_format      TEXT NOT NULL CHECK (goal_format <> ''),
+    goal_json        TEXT NOT NULL,
+    goal_fingerprint TEXT NOT NULL
+)
+"""
+
 _RENAME_V1_MISSIONS = 'ALTER TABLE missions RENAME TO missions_v1'
 
 _COPY_V1_MISSIONS = """
@@ -375,6 +404,15 @@ WHERE mission_id = ?
 _DELETE_RECONCILIATION_CONTEXT = (
     'DELETE FROM mission_reconciliation_contexts WHERE mission_id = ?')
 
+_GOAL_OF_DISPATCH = 'SELECT * FROM dispatch_goals WHERE dispatch_id = ?'
+
+# The only statement that writes dispatch_goals, and only the first preparation of a step runs
+# it. There is no later binding, backfill or repair.
+_INSERT_GOAL = """
+INSERT INTO dispatch_goals (dispatch_id, goal_format, goal_json, goal_fingerprint)
+VALUES (?, ?, ?, ?)
+"""
+
 _EVIDENCE_BY_ID = 'SELECT * FROM recovery_evidence WHERE evidence_id = ?'
 
 # ORDER BY evidence_id is deterministic and nothing more: it is not chronological, and neither is
@@ -471,6 +509,53 @@ def _to_context(row: sqlite3.Row, dispatch: DispatchRecord) -> DispatchContextRe
         action_name=row['action_name'],
         action_type=row['action_type'],
         robot_namespace=row['robot_namespace'],
+    )
+
+
+def _to_dispatch_goal(row: sqlite3.Row, dispatch: DispatchRecord) -> DispatchGoalRecord:
+    # Nothing is repaired: any mismatch below means the row was changed behind our back.
+    # Every caller has already chosen the row by this dispatch, so its dispatch_id is not read.
+    def corrupt(reason: str, value: object = None) -> CorruptDispatchGoal:
+        return CorruptDispatchGoal(dispatch.mission_id, dispatch.step_key, reason, value)
+
+    goal_format = row['goal_format']
+    if not isinstance(goal_format, str) or not goal_format:
+        raise corrupt('goal_format is not valid text', goal_format)
+    stored_json = row['goal_json']
+    if not isinstance(stored_json, str):
+        raise corrupt('goal_json is not text', stored_json)
+    stored_fingerprint = row['goal_fingerprint']
+    if not isinstance(stored_fingerprint, str):
+        raise corrupt('goal_fingerprint is not text', stored_fingerprint)
+
+    try:
+        payload = json.loads(stored_json)
+    except (ValueError, RecursionError):
+        raise corrupt('goal_json is not valid JSON', stored_json) from None
+    # Reconstructing through the same canonicalizer that built it is the one canonicalization
+    # system this project has: if the stored text and fingerprint do not match what that
+    # canonicalizer produces from the decoded payload, the row was changed behind our back.
+    # goal_format is already a validated non-empty str, so the only way this constructor can
+    # fail is a decoded payload outside the strict JSON domain (including a non-finite float,
+    # which json.loads accepts as NaN/Infinity/-Infinity even though this project's domain does
+    # not), and ExpectedGoalSpecification always reports that as InvalidRequest.
+    try:
+        reconstructed = ExpectedGoalSpecification(goal_format=goal_format, payload=payload)
+    except InvalidRequest as error:
+        raise corrupt(f'goal_json does not fit the goal domain: {error}', stored_json) from None
+    if reconstructed.goal_json != stored_json:
+        raise corrupt('goal_json is not canonical for the decoded payload', stored_json)
+    if reconstructed.goal_fingerprint != stored_fingerprint:
+        raise corrupt(
+            'goal_fingerprint does not match goal_format and payload', stored_fingerprint)
+
+    return DispatchGoalRecord(
+        dispatch_id=dispatch.dispatch_id,
+        mission_id=dispatch.mission_id,
+        step_key=dispatch.step_key,
+        goal_format=goal_format,
+        payload=payload,
+        goal_fingerprint=stored_fingerprint,
     )
 
 
@@ -762,20 +847,25 @@ class MissionStore:
 
     def prepare_step_dispatch(
         self, mission_id: str, step_key: str, action: ExpectedActionContext,
+        goal: ExpectedGoalSpecification,
     ) -> DispatchRecord:
         """
-        Reserve the step's dispatch identity, and bind the action it is declared to reach.
+        Reserve the step's dispatch identity, and bind the action and the goal it carries.
 
-        The identity, the action context and DISPATCH_PREPARED commit together, and this
-        first preparation is the only thing that ever binds a context. The context is declared
-        intent, not proof of where a request is sent, and preparing authorizes no send.
-        Replaying with the same context changes nothing; a different one raises
-        DispatchContextConflict; a dispatch with no context raises DispatchContextMissing.
-        A replay writes nothing, and a context is never replaced or added afterwards.
+        The identity, the action context, the goal specification and DISPATCH_PREPARED commit
+        together, and this first preparation is the only thing that ever binds either. Both are
+        declared intent, not proof of where a request is sent or what was executed, and
+        preparing authorizes no send. Replaying with the same action and the same goal changes
+        nothing; a different action raises DispatchContextConflict; a different goal raises
+        DispatchGoalConflict; a dispatch with no context raises DispatchContextMissing; one with
+        no goal raises DispatchGoalMissing. A replay writes nothing, and neither is ever
+        replaced, updated or repaired afterwards.
         """
         # Before any database access, like the other argument checks.
         if not isinstance(action, ExpectedActionContext):
             raise TypeError(f'action must be an ExpectedActionContext, got {action!r}')
+        if not isinstance(goal, ExpectedGoalSpecification):
+            raise TypeError(f'goal must be an ExpectedGoalSpecification, got {goal!r}')
         with self._transaction():
             step = self._require_step(mission_id, step_key)
             # The state machine decides. The same state means this is a replay,
@@ -788,23 +878,28 @@ class MissionStore:
                 if existing is None:
                     raise CorruptDispatchRecord(
                         mission_id, step_key, f'step is {step.state.value} but has no dispatch')
+                # Context precedence before goal, preserving Task 009's diagnostic order.
                 self._require_matching_context(existing, action)
+                self._require_matching_goal(existing, goal)
                 return existing
             if existing is not None:
                 raise CorruptDispatchRecord(
                     mission_id, step_key, f'step is {step.state.value} but already has a dispatch',
                     str(existing.dispatch_id))
 
-            # The ID, the context and DISPATCH_PREPARED commit together. That only reserves the
-            # identity and declares the action, and both stay whether or not anything is ever
-            # sent. It does not authorize an external send: authorize_step_send is the
-            # separate operation that does. This is the only place a context is inserted.
+            # The ID, the context, the goal and DISPATCH_PREPARED commit together. That only
+            # reserves the identity and declares the action and the goal, and all three stay
+            # whether or not anything is ever sent. It does not authorize an external send:
+            # authorize_step_send is the separate operation that does. This is the only place
+            # a context or a goal is inserted.
             dispatch_id = uuid.uuid4()
             now = _utc_now()
             self._conn.execute(_INSERT_DISPATCH, (str(dispatch_id), mission_id, step_key, now))
             self._conn.execute(_INSERT_CONTEXT, (
                 str(dispatch_id), action.action_name, action.action_type,
                 action.robot_namespace))
+            self._conn.execute(_INSERT_GOAL, (
+                str(dispatch_id), goal.goal_format, goal.goal_json, goal.goal_fingerprint))
             self._conn.execute(_SET_STEP_STATE, (new_state.value, now, mission_id, step_key))
             return self._require_dispatch(mission_id, step_key)
 
@@ -812,13 +907,13 @@ class MissionStore:
         """
         Authorize the one send of a prepared step, consuming one attempt for it.
 
-        The step's dispatch must also have a bound action context. The checks and all three
-        writes, the attempt, the durable authorization record and DISPATCHED, are a single
-        transaction, and the receipt is returned only once it has committed. Nothing external
-        happens in here: the caller sends afterwards, and only a caller that got a receipt
-        may. A replay is refused and is never answered with the earlier receipt. A committed
-        authorization is not undone, so a crash after the commit can mean no send at all, but
-        never a second authorization.
+        The step's dispatch must also have a bound action context and a bound goal
+        specification. The checks and all three writes, the attempt, the durable authorization
+        record and DISPATCHED, are a single transaction, and the receipt is returned only once
+        it has committed. Nothing external happens in here: the caller sends afterwards, and
+        only a caller that got a receipt may. A replay is refused and is never answered with the
+        earlier receipt. A committed authorization is not undone, so a crash after the commit
+        can mean no send at all, but never a second authorization.
         """
         with self._transaction():
             mission = self._require(_BY_MISSION_ID, mission_id)
@@ -842,9 +937,11 @@ class MissionStore:
                 raise CorruptDispatchRecord(
                     mission_id, step_key, f'step is {step.state.value} but has no dispatch')
 
-            # The action the dispatch is declared to reach must be bound before any send can be
-            # authorized. Like the checks above, this comes before anything is written.
+            # The action the dispatch is declared to reach, and the goal it carries, must both
+            # be bound before any send can be authorized. Like the checks above, this comes
+            # before anything is written, and before the authorization-provenance precheck below.
             self._require_context(dispatch)
+            self._require_goal(dispatch)
 
             # A step that is still DISPATCH_PREPARED cannot already have an authorization
             # record. If it does, the row is not ours and not a receipt to hand back: it is
@@ -892,6 +989,16 @@ class MissionStore:
         """Return the action context bound to the step's dispatch. Never binds or repairs one."""
         self._require_step(mission_id, step_key)
         return self._require_context(self._require_dispatch(mission_id, step_key))
+
+    def get_dispatch_goal(self, mission_id: str, step_key: str) -> DispatchGoalRecord:
+        """
+        Return the goal specification bound to the step's dispatch. Never binds or repairs one.
+
+        Mirrors get_dispatch_context: the context says WHERE a dispatch is declared to reach,
+        this says WHAT it is declared to carry. Neither is evidence that anything was sent.
+        """
+        self._require_step(mission_id, step_key)
+        return self._require_goal(self._require_dispatch(mission_id, step_key))
 
     def get_dispatch_authorization(
         self, mission_id: str, step_key: str,
@@ -1207,7 +1314,8 @@ class MissionStore:
                 self._conn.execute(_DISPATCH_AUTHORIZATIONS_DDL)
                 self._conn.execute(_RECOVERY_EVIDENCE_DDL)
                 self._conn.execute(_MISSION_RECONCILIATION_CONTEXTS_DDL)
-            elif version in (1, 2, 3, 4, 5, 6):
+                self._conn.execute(_DISPATCH_GOALS_DDL)
+            elif version in (1, 2, 3, 4, 5, 6, 7):
                 # An older database goes through every step up to the current version inside
                 # this one transaction, so no version in between is ever committed.
                 if version == 1:
@@ -1220,7 +1328,9 @@ class MissionStore:
                     self._migrate_v4_to_v5()
                 if version <= 5:
                     self._migrate_v5_to_v6()
-                self._migrate_v6_to_v7()
+                if version <= 6:
+                    self._migrate_v6_to_v7()
+                self._migrate_v7_to_v8()
             else:
                 raise UnsupportedSchemaVersion(version)
             self._conn.execute(f'PRAGMA user_version = {SCHEMA_VERSION}')
@@ -1261,6 +1371,12 @@ class MissionStore:
         # Only a table is added. A mission that is already NEEDS_RECONCILIATION gets no context:
         # whether it was to resume as RUNNING or as CANCELLING cannot be told, so none is made up.
         self._conn.execute(_MISSION_RECONCILIATION_CONTEXTS_DDL)
+
+    def _migrate_v7_to_v8(self) -> None:
+        # Only a table is added. A dispatch that is still DISPATCH_PREPARED gets no goal: the
+        # store cannot know whether the newly required binding is what it was originally meant
+        # to carry, so none is made up.
+        self._conn.execute(_DISPATCH_GOALS_DDL)
 
     def _fetch(self, query: str, value: str) -> MissionRecord | None:
         row = self._conn.execute(query, (value,)).fetchone()
@@ -1341,6 +1457,16 @@ class MissionStore:
             raise DispatchContextMissing(dispatch.mission_id, dispatch.step_key)
         return context
 
+    def _fetch_goal(self, dispatch: DispatchRecord) -> DispatchGoalRecord | None:
+        row = self._conn.execute(_GOAL_OF_DISPATCH, (str(dispatch.dispatch_id),)).fetchone()
+        return None if row is None else _to_dispatch_goal(row, dispatch)
+
+    def _require_goal(self, dispatch: DispatchRecord) -> DispatchGoalRecord:
+        goal = self._fetch_goal(dispatch)
+        if goal is None:
+            raise DispatchGoalMissing(dispatch.mission_id, dispatch.step_key)
+        return goal
+
     def _fetch_authorization(self, dispatch: DispatchRecord) -> DispatchAuthorizationRecord | None:
         row = self._conn.execute(
             _AUTHORIZATION_OF_DISPATCH, (str(dispatch.dispatch_id),)).fetchone()
@@ -1417,3 +1543,24 @@ class MissionStore:
             name for name in _CONTEXT_FIELDS if getattr(bound, name) != getattr(action, name))
         if differing:
             raise DispatchContextConflict(dispatch.mission_id, dispatch.step_key, differing)
+
+    def _require_matching_goal(
+        self, dispatch: DispatchRecord, goal: ExpectedGoalSpecification,
+    ) -> None:
+        # Reads only. A missing or malformed goal is never bound, backfilled or guessed here: a
+        # dispatch prepared before schema version 8 has none, and one whose row was removed
+        # outside this code is indistinguishable, so both fail closed with DispatchGoalMissing
+        # (a malformed one, CorruptDispatchGoal). Equality is decided from the format and the
+        # complete canonical JSON text, reconstructed through the same canonicalizer that built
+        # it, never from the fingerprint alone: a hash match is not treated as proof of identity,
+        # only the stored bytes are.
+        bound = self._require_goal(dispatch)
+        reconstructed = ExpectedGoalSpecification(
+            goal_format=bound.goal_format, payload=bound.payload)
+        differing = tuple(
+            name for name, matches in (
+                ('goal_format', bound.goal_format == goal.goal_format),
+                ('goal_content', reconstructed.goal_json == goal.goal_json),
+            ) if not matches)
+        if differing:
+            raise DispatchGoalConflict(dispatch.mission_id, dispatch.step_key, differing)

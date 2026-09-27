@@ -83,12 +83,13 @@ def check_list(conn, table, column):
     return re.findall(r"'([^']*)'", match.group(1))
 
 
-def test_fresh_database_is_created_at_version_7(conn):
-    assert conn.execute('PRAGMA user_version').fetchone()[0] == 7
+def test_fresh_database_is_created_at_version_8(conn):
+    assert conn.execute('PRAGMA user_version').fetchone()[0] == 8
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert tables == {
         'missions', 'mission_steps', 'step_dispatches', 'dispatch_contexts',
         'dispatch_authorizations', 'recovery_evidence', 'mission_reconciliation_contexts',
+        'dispatch_goals',
     }
 
 
@@ -122,6 +123,11 @@ def test_mission_reconciliation_contexts_table_holds_only_the_mission_and_the_st
     assert columns(conn, 'mission_reconciliation_contexts') == ['mission_id', 'resume_state']
     assert check_list(conn, 'mission_reconciliation_contexts', 'resume_state') == [
         'RUNNING', 'CANCELLING']
+
+
+def test_dispatch_goals_table_holds_only_the_goal_specification_columns(conn):
+    assert columns(conn, 'dispatch_goals') == [
+        'dispatch_id', 'goal_format', 'goal_json', 'goal_fingerprint']
 
 
 def test_mission_steps_table_holds_only_identity_order_and_state(conn):

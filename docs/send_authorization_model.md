@@ -10,7 +10,9 @@ Task 008 itself changed no schema: version 3 stayed as it was, with no migration
 Task 009 later moved the schema to version 4 and added one precondition to this operation, the
 bound action context (see "The operation" and `docs/dispatch_context_model.md`). Task 010 then moved
 it to version 5 and made the operation also commit a durable per-dispatch record that the
-authorization was committed (see "The operation" and `docs/dispatch_authorization_model.md`).
+authorization was committed (see "The operation" and `docs/dispatch_authorization_model.md`). Task
+013 then moved the schema to version 8 and added a second precondition, a durable bound goal
+specification (see "The operation" and `docs/dispatch_goal_model.md`).
 
 ## The attempt
 
@@ -77,12 +79,13 @@ the first that fails raises without having written anything:
 | 6 | no step of the mission is `OUTCOME_UNKNOWN` | `MissionReconciliationRequired(mission_id, step_keys)` |
 | 7 | the step has exactly one dispatch row with a canonical UUID | `CorruptDispatchRecord` |
 | 8 | the dispatch has a valid bound action context (added by Task 009) | `DispatchContextMissing`, `CorruptDispatchContext` |
-| 9 | the dispatch has no authorization record yet (added by Task 010) | `CorruptDispatchAuthorization` |
-| 10 | the state machine still allows `DISPATCH_PREPARED` to `DISPATCHED` | `InvalidStateTransition` |
-| 11 | an attempt remains, and one is taken | `AttemptLimitReached` |
-| 12 | the authorization record is inserted (added by Task 010) | |
-| 13 | the step is moved to `DISPATCHED` | |
-| 14 | the receipt is returned, only after the transaction commits | |
+| 9 | the dispatch has a valid bound goal specification (added by Task 013) | `DispatchGoalMissing`, `CorruptDispatchGoal` |
+| 10 | the dispatch has no authorization record yet (added by Task 010) | `CorruptDispatchAuthorization` |
+| 11 | the state machine still allows `DISPATCH_PREPARED` to `DISPATCHED` | `InvalidStateTransition` |
+| 12 | an attempt remains, and one is taken | `AttemptLimitReached` |
+| 13 | the authorization record is inserted (added by Task 010) | |
+| 14 | the step is moved to `DISPATCHED` | |
+| 15 | the receipt is returned, only after the transaction commits | |
 
 Check 8 is the only change Task 009 makes to this operation. It comes before anything is written,
 so a refusal takes no attempt and changes no cell. The order of every other check is as before,
@@ -92,10 +95,23 @@ Nothing binds a context afterwards, so a prepared step that has none, whether it
 version 3 or its context was removed outside the supported code, cannot be authorized. It fails
 closed with `DispatchContextMissing` and the store does not try to tell the two apart.
 
-Check 9 and the insert at step 12 are Task 010's. A step that is `DISPATCH_PREPARED` cannot already
+Check 9 is Task 013's. The action context (check 8) says **where** a dispatch is declared to
+reach; the goal specification (check 9) says **what** it is declared to carry. They are different
+questions, checked one after the other, and either can fail independently: a dispatch can have a
+valid context and no goal, or (only outside the supported code) a valid goal and a corrupt
+context. Both checks run, and both fail, before an attempt is consumed: a refused authorization
+here writes nothing and changes no cell, exactly like check 8. A `DISPATCH_PREPARED` dispatch that
+predates schema version 8, or whose goal row was removed outside the supported code, can never
+receive a new send authorization: nothing binds a goal afterwards, and a later
+`prepare_step_dispatch` replay does not backfill one, because the store cannot know that a newly
+supplied body is what the dispatch was originally meant to execute. See
+`docs/dispatch_goal_model.md`.
+
+Check 10 and the insert at step 13 are Task 010's. A step that is `DISPATCH_PREPARED` cannot already
 have an authorization record, so one that does is corruption: it is not answered with an earlier
 receipt, is not deleted or replaced, and takes no attempt. The check comes after the context and
-before the state machine and the budget, so nothing else changes its place or its error.
+the goal and before the state machine and the budget, so nothing else changes its place or its
+error.
 
 The writes are exactly three, in this order and with one shared timestamp: on the mission row,
 `attempts_used` and `updated_at`; one new row in `dispatch_authorizations`, holding the dispatch

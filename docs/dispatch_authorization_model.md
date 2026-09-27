@@ -134,14 +134,15 @@ having written anything. Task 010 adds one check and one write:
 | 5 | no step of the mission is `OUTCOME_UNKNOWN` | `MissionReconciliationRequired` |
 | 6 | the step has exactly one dispatch with a canonical UUID | `CorruptDispatchRecord` |
 | 7 | the dispatch has a valid bound context | `DispatchContextMissing`, `CorruptDispatchContext` |
-| **8** | **the dispatch has no authorization row yet** | `CorruptDispatchAuthorization` |
-| 9 | the state machine allows `DISPATCH_PREPARED` to `DISPATCHED` | `InvalidStateTransition` |
-| 10 | an attempt remains, and one is taken | `AttemptLimitReached` |
-| **11** | **the authorization row is inserted, with the same timestamp** | |
-| 12 | the step is moved to `DISPATCHED`, with the same timestamp | |
-| 13 | the row is read back for the receipt | |
-| 14 | `COMMIT` | |
-| 15 | the receipt is returned, only after the commit | |
+| 8 | the dispatch has a valid bound goal specification (added by Task 013) | `DispatchGoalMissing`, `CorruptDispatchGoal` |
+| **9** | **the dispatch has no authorization row yet** | `CorruptDispatchAuthorization` |
+| 10 | the state machine allows `DISPATCH_PREPARED` to `DISPATCHED` | `InvalidStateTransition` |
+| 11 | an attempt remains, and one is taken | `AttemptLimitReached` |
+| **12** | **the authorization row is inserted, with the same timestamp** | |
+| 13 | the step is moved to `DISPATCHED`, with the same timestamp | |
+| 14 | the row is read back for the receipt | |
+| 15 | `COMMIT` | |
+| 16 | the receipt is returned, only after the commit | |
 
 The writes are the attempt `UPDATE`, the authorization `INSERT` and the step `UPDATE`, in that order,
 and the step update is the last write. Before `COMMIT` a failure at any of them, or at `COMMIT`
@@ -149,12 +150,22 @@ itself, rolls all of it back: the attempt count is unchanged, there is no row, a
 `DISPATCH_PREPARED`. After `COMMIT` all three survive. There is no window in which one exists without
 the others, and a test injects a failure at every statement and kills real processes at each.
 
-**Check 8.** A step that is `DISPATCH_PREPARED` and already has a row is a contradiction, because a row
+**Check 8 (Task 013).** A dispatch also needs a valid bound goal specification, checked immediately
+after the context and before this table's own precheck (check 9). Task 013 changed only the
+prerequisite for creating a **new** authorization; it added no column, no check and no write to
+`dispatch_authorizations` itself, which is exactly as Task 010 left it. A row already written under
+version 5 through 7, for a dispatch that has since lost its goal row (which only something outside the
+supported code can do), still reads back exactly as before: `get_dispatch_authorization` and every
+historical use of a row are unaffected by a missing or corrupt goal, because neither reads
+`dispatch_goals`. Only the creation of a *new* row, at check 8, can now also fail with
+`DispatchGoalMissing` or `CorruptDispatchGoal`. See `docs/dispatch_goal_model.md`.
+
+**Check 9.** A step that is `DISPATCH_PREPARED` and already has a row is a contradiction, because a row
 is only ever written together with the move out of `DISPATCH_PREPARED`. It is reported as corruption.
 It is not answered with an earlier receipt, the row is not deleted or replaced, no attempt is taken and
-the step does not move. The check comes after the context (so a missing context is reported first) and
-before the state machine and the budget (so a corrupt row is reported even when the budget is spent).
-Every check of Tasks 008 and 009 keeps its place and its error.
+the step does not move. The check comes after the context and the goal (so a missing context or goal is
+reported first) and before the state machine and the budget (so a corrupt row is reported even when the
+budget is spent). Every check of Tasks 008 and 009 keeps its place and its error.
 
 `transition_step_state(..., DISPATCHED)` still raises `SendAuthorizationRequired`, so the only way to
 enter `DISPATCHED` is the operation that writes the row. Preparation, an ordinary transition and a

@@ -113,6 +113,49 @@ class MissionRequest:
 
 
 @dataclass(frozen=True)
+class ExpectedGoalSpecification:
+    """
+    The exact external goal a dispatch is declared to carry, reduced to its canonical form.
+
+    Mirrors MissionRequest's own snapshot pattern: the caller's payload is not kept, only its
+    canonical JSON text and a fingerprint over the COMPLETE specification (goal_format together
+    with the payload, not the payload alone), so a later mutation of the caller's own dict or
+    list cannot change what this object, or what gets durably bound from it, means. goal_format
+    is opaque to the store: it names which adapter format/version the payload is meant for, and
+    is never interpreted here.
+    """
+
+    goal_format: str
+    # The payload is not kept: a caller-owned object could change after validation and stop
+    # matching goal_json and goal_fingerprint.
+    payload: InitVar[Any]
+    goal_json: str = field(init=False, repr=False)
+    goal_fingerprint: str = field(init=False)
+
+    def __post_init__(self, payload: Any) -> None:
+        if not isinstance(self.goal_format, str):
+            raise TypeError(f'goal_format must be a str, got {self.goal_format!r}')
+        if not self.goal_format:
+            raise ValueError('goal_format must not be empty')
+
+        try:
+            _check_json(payload, 'payload', set())
+            goal_json = _dumps(payload)
+            # goal_format is part of what is bound: the same payload under a different format
+            # is a different specification, not a way to relabel an existing one.
+            complete = _dumps({'goal_format': self.goal_format, 'payload': payload})
+        except InvalidRequest:
+            raise
+        except (RecursionError, ValueError) as exc:
+            # Nesting past the interpreter's limit, or an int with too many digits.
+            raise InvalidRequest(f'payload cannot be serialised: {exc}') from exc
+
+        object.__setattr__(self, 'goal_json', goal_json)
+        object.__setattr__(
+            self, 'goal_fingerprint', hashlib.sha256(complete.encode('utf-8')).hexdigest())
+
+
+@dataclass(frozen=True)
 class MissionRecord:
     """A mission as stored. A snapshot: it does not track later changes in the store."""
 
@@ -178,6 +221,39 @@ class DispatchContextRecord:
         # The namespace is different: an empty string is an exact value.
         if not self.action_name or not self.action_type:
             raise ValueError('action_name and action_type must be non-empty')
+
+
+@dataclass(frozen=True)
+class DispatchGoalRecord:
+    """
+    The goal specification bound to a dispatch, as stored.
+
+    It is what was declared when the dispatch was prepared: the exact external request its
+    action context is meant to carry. It is neither an authorization nor proof that anything
+    was sent or executed. goal_format is opaque and never interpreted here. payload is a
+    decoded snapshot of what is durably stored, in the same limited sense MissionRecord.payload
+    is: a normal, mutable dict/list locally, but mutating it never writes through to SQLite, and
+    it is never re-read from a caller's own object once this record exists.
+    """
+
+    dispatch_id: uuid.UUID
+    mission_id: str
+    step_key: str
+    goal_format: str
+    payload: Any
+    goal_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.dispatch_id, uuid.UUID):
+            raise TypeError(f'dispatch_id must be a uuid.UUID, got {self.dispatch_id!r}')
+        for name in ('mission_id', 'step_key', 'goal_format', 'goal_fingerprint'):
+            value = getattr(self, name)
+            if not isinstance(value, str):
+                raise TypeError(f'{name} must be a str, got {value!r}')
+        if not self.mission_id or not self.step_key:
+            raise ValueError('mission_id and step_key must not be empty')
+        if not self.goal_format:
+            raise ValueError('goal_format must not be empty')
 
 
 @dataclass(frozen=True)

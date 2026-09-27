@@ -50,7 +50,12 @@ from task_resilience.errors import (
     StepNotAwaitingSend,
     StepNotFound,
 )
-from task_resilience.model import DispatchContextRecord, DispatchRecord, SendAuthorization
+from task_resilience.model import (
+    DispatchContextRecord,
+    DispatchRecord,
+    ExpectedGoalSpecification,
+    SendAuthorization,
+)
 from task_resilience.reconciliation import ExpectedActionContext
 from task_resilience.state_machine import MissionState, StepState, transition_step
 from task_resilience.storage import MissionStore
@@ -68,7 +73,10 @@ ACTION = ExpectedActionContext(
     action_name='/navigate_to_pose', action_type='nav2_msgs/action/NavigateToPose',
     robot_namespace='/robot1')
 
-# The tables as version 6 defines them, written out here so a new column or table shows up.
+GOAL = ExpectedGoalSpecification(
+    goal_format='test/goal/v1', payload={'target': 'checkpoint-a'})
+
+# The tables as version 8 defines them, written out here so a new column or table shows up.
 COLUMNS = {
     'missions': [
         'mission_id', 'request_id', 'request_fingerprint', 'request_json', 'max_attempts',
@@ -86,6 +94,7 @@ COLUMNS = {
         'recorded_at',
     ],
     'mission_reconciliation_contexts': ['mission_id', 'resume_state'],
+    'dispatch_goals': ['dispatch_id', 'goal_format', 'goal_json', 'goal_fingerprint'],
 }
 V3_TABLES = ['missions', 'mission_steps', 'step_dispatches']
 V4_TABLES = [*V3_TABLES, 'dispatch_contexts']
@@ -146,7 +155,7 @@ def make_mission(store, request_id='req-001', max_attempts=3, keys=KEYS, prepare
     mission = store.create_or_get(request_id, {'goal': 'demo'}, max_attempts)
     store.initialize_steps(mission.mission_id, keys)
     for key in prepared:
-        store.prepare_step_dispatch(mission.mission_id, key, ACTION)
+        store.prepare_step_dispatch(mission.mission_id, key, ACTION, GOAL)
     for state in route:
         store.transition_mission_state(mission.mission_id, state)
     return mission.mission_id
@@ -272,19 +281,20 @@ def make_v3_database(path):
 
 # The schema
 
-def test_the_schema_is_exactly_version_7_and_the_context_table_stores_no_evidence(db_path):
+def test_the_schema_is_exactly_version_8_and_the_context_table_stores_no_evidence(db_path):
     MissionStore(db_path).close()
 
-    assert storage.SCHEMA_VERSION == 7
-    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
+    assert storage.SCHEMA_VERSION == 8
+    assert raw(db_path, 'PRAGMA user_version') == [(8,)]
     assert table_names(db_path) == set(COLUMNS)
     # Version 4 added the context table, version 5 the authorization table, version 6 the one
-    # evidence table and version 7 the one reconciliation table.
+    # evidence table, version 7 the one reconciliation table and version 8 the one goal table.
     assert set(COLUMNS) - set(V3_TABLES) == {
         'dispatch_contexts', 'dispatch_authorizations', 'recovery_evidence',
-        'mission_reconciliation_contexts'}
+        'mission_reconciliation_contexts', 'dispatch_goals'}
     assert set(COLUMNS) - set(V4_TABLES) == {
-        'dispatch_authorizations', 'recovery_evidence', 'mission_reconciliation_contexts'}
+        'dispatch_authorizations', 'recovery_evidence', 'mission_reconciliation_contexts',
+        'dispatch_goals'}
     # The only tables named for evidence or reconciliation are those two. The context table still
     # holds no evidence.
     assert sorted(name for name in table_names(db_path)
@@ -315,12 +325,26 @@ def test_the_context_table_is_the_three_strings_keyed_by_the_dispatch(db_path):
     'goal', 'hash', 'body', 'epoch', 'incarnation', 'created', 'updated', 'time', 'evidence',
     'retry', 'attempt', 'lease', 'owner', 'fence', 'revision'])
 def test_no_goal_time_evidence_or_ownership_field_is_stored(db_path, word):
+    # Scoped to dispatch_contexts and DispatchContextRecord: the action context still says only
+    # WHERE a dispatch is declared to reach, never WHAT it carries. Since Task 013, "goal" is
+    # intentionally NOT one of these absent words for dispatch_goals (see the test below):
+    # binding a goal specification is that table's whole purpose.
     MissionStore(db_path).close()
 
     columns = [row[1] for row in raw(db_path, 'PRAGMA table_info(dispatch_contexts)')]
     assert not [column for column in columns if word in column]
     assert not [field.name for field in dataclasses.fields(DispatchContextRecord)
                 if word in field.name]
+
+
+def test_the_goal_table_does_intentionally_store_a_goal_specification(db_path):
+    # The inverse of the guard above: dispatch_goals is not another dispatch_contexts, and its
+    # whole purpose is to hold exactly what the context table above must never hold.
+    MissionStore(db_path).close()
+
+    columns = [row[1] for row in raw(db_path, 'PRAGMA table_info(dispatch_goals)')]
+    assert any('goal' in column for column in columns)
+    assert any('fingerprint' in column for column in columns)
 
 
 @contextlib.contextmanager
@@ -383,7 +407,7 @@ def test_the_namespace_is_stored_and_read_back_exactly(store, db_path, namespace
     action = ExpectedActionContext(
         action_name='/nav', action_type='pkg/action/Nav', robot_namespace=namespace)
 
-    store.prepare_step_dispatch(mission_id, 'checkpoint_a', action)
+    store.prepare_step_dispatch(mission_id, 'checkpoint_a', action, GOAL)
 
     assert raw(db_path, 'SELECT robot_namespace FROM dispatch_contexts') == [(namespace,)]
     assert store.get_dispatch_context(mission_id, 'checkpoint_a').robot_namespace == namespace
@@ -396,7 +420,7 @@ def test_lookalike_namespaces_stay_different_values(store):
 
     for key, namespace in zip(keys, namespaces):
         store.prepare_step_dispatch(mission_id, key, ExpectedActionContext(
-            action_name='/nav', action_type='pkg/action/Nav', robot_namespace=namespace))
+            action_name='/nav', action_type='pkg/action/Nav', robot_namespace=namespace), GOAL)
 
     assert [store.get_dispatch_context(mission_id, key).robot_namespace
             for key in keys] == namespaces
@@ -415,7 +439,7 @@ def test_the_action_name_and_type_are_stored_and_read_back_exactly(
     mission_id = make_mission(store)
 
     store.prepare_step_dispatch(mission_id, 'checkpoint_a', ExpectedActionContext(
-        action_name=action_name, action_type=action_type, robot_namespace='/r'))
+        action_name=action_name, action_type=action_type, robot_namespace='/r'), GOAL)
 
     bound = store.get_dispatch_context(mission_id, 'checkpoint_a')
     assert (bound.action_name, bound.action_type) == (action_name, action_type)
@@ -425,7 +449,7 @@ def test_an_empty_namespace_is_accepted(store):
     mission_id = make_mission(store)
 
     store.prepare_step_dispatch(mission_id, 'checkpoint_a', ExpectedActionContext(
-        action_name='/nav', action_type='pkg/action/Nav', robot_namespace=''))
+        action_name='/nav', action_type='pkg/action/Nav', robot_namespace=''), GOAL)
 
     assert store.get_dispatch_context(mission_id, 'checkpoint_a').robot_namespace == ''
 
@@ -463,7 +487,7 @@ def test_a_wrong_action_argument_is_rejected_before_the_database_is_touched(db_p
         try:
             # A store that reached the database would fail on the lock instead.
             with pytest.raises(TypeError, match='ExpectedActionContext'):
-                store.prepare_step_dispatch('no-such-mission', 'no-such-step', bad)
+                store.prepare_step_dispatch('no-such-mission', 'no-such-step', bad, GOAL)
         finally:
             blocker.execute('ROLLBACK')
             blocker.close()
@@ -483,7 +507,7 @@ def test_a_wrong_action_binds_nothing_for_a_real_step(store, db_path):
     before = dump(db_path)
 
     with pytest.raises(TypeError):
-        store.prepare_step_dispatch(mission_id, 'checkpoint_a', 'not an action')
+        store.prepare_step_dispatch(mission_id, 'checkpoint_a', 'not an action', GOAL)
 
     assert dump(db_path) == before
 
@@ -493,7 +517,7 @@ def test_a_wrong_action_binds_nothing_for_a_real_step(store, db_path):
 def test_preparation_binds_the_uuid_the_context_and_the_state_together(store, db_path):
     mission_id = make_mission(store)
 
-    record = store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION)
+    record = store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION, GOAL)
 
     assert isinstance(record, DispatchRecord)
     assert (record.mission_id, record.step_key) == (mission_id, 'checkpoint_a')
@@ -514,11 +538,12 @@ def test_only_the_expected_rows_and_cells_change_on_first_preparation(store, db_
     mission_id = make_mission(store)
     before = dump(db_path)
 
-    record = store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION)
+    record = store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION, GOAL)
 
     diff = table_diff(before, dump(db_path))
     # No mission row, and not the other step.
-    assert set(diff) == {'mission_steps', 'step_dispatches', 'dispatch_contexts'}
+    assert set(diff) == {
+        'mission_steps', 'step_dispatches', 'dispatch_contexts', 'dispatch_goals'}
     (old_step,), (new_step,) = diff['mission_steps']
     changed = {column for column, was, now in zip(COLUMNS['mission_steps'], old_step, new_step)
                if was != now}
@@ -530,6 +555,8 @@ def test_only_the_expected_rows_and_cells_change_on_first_preparation(store, db_
     assert diff['dispatch_contexts'] == (
         [], [(str(record.dispatch_id), '/navigate_to_pose', 'nav2_msgs/action/NavigateToPose',
               '/robot1')])
+    assert diff['dispatch_goals'] == (
+        [], [(str(record.dispatch_id), 'test/goal/v1', GOAL.goal_json, GOAL.goal_fingerprint)])
 
 
 def test_preparation_consumes_no_attempt_and_leaves_the_mission_row_alone(store):
@@ -537,7 +564,7 @@ def test_preparation_consumes_no_attempt_and_leaves_the_mission_row_alone(store)
     before = store.get_by_mission_id(mission_id)
 
     for key in KEYS:
-        store.prepare_step_dispatch(mission_id, key, ACTION)
+        store.prepare_step_dispatch(mission_id, key, ACTION, GOAL)
 
     assert before.attempts_used == 0
     assert store.get_by_mission_id(mission_id) == before
@@ -559,8 +586,8 @@ def test_every_step_gets_its_own_dispatch_and_its_own_context(store):
         action_name='/compute_path', action_type='nav2_msgs/action/ComputePathToPose',
         robot_namespace='/robot2')
 
-    first = store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION)
-    second = store.prepare_step_dispatch(mission_id, 'return_to_base', other)
+    first = store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION, GOAL)
+    second = store.prepare_step_dispatch(mission_id, 'return_to_base', other, GOAL)
 
     assert first.dispatch_id != second.dispatch_id
     assert store.get_dispatch_context(mission_id, 'checkpoint_a').action_name == (
@@ -594,7 +621,7 @@ def test_a_refused_preparation_binds_nothing(store, db_path, error, mission, ste
     before = dump(db_path)
 
     with pytest.raises(error):
-        store.prepare_step_dispatch(mission or mission_id, step, ACTION)
+        store.prepare_step_dispatch(mission or mission_id, step, ACTION, GOAL)
 
     assert dump(db_path) == before
 
@@ -606,7 +633,7 @@ def test_the_context_survives_reopening_the_store(db_path):
 
     with MissionStore(db_path) as reopened:
         assert reopened.get_dispatch_context(mission_id, 'checkpoint_a') == bound
-        assert reopened.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION) == (
+        assert reopened.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION, GOAL) == (
             reopened.get_step_dispatch(mission_id, 'checkpoint_a'))
 
 
@@ -639,12 +666,12 @@ def test_replaying_the_same_context_returns_the_same_record_and_writes_nothing(
     store, connection = open_faulty_store(monkeypatch, db_path)
     with store:
         mission_id = make_mission(store)
-        first = store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION)
+        first = store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION, GOAL)
         before = dump(db_path)
         connection.statements.clear()
 
         # An equal context, not the same object.
-        second = store.prepare_step_dispatch(mission_id, 'checkpoint_a', replay_with())
+        second = store.prepare_step_dispatch(mission_id, 'checkpoint_a', replay_with(), GOAL)
 
         assert second == first
         assert dump(db_path) == before
@@ -657,11 +684,11 @@ def test_replaying_the_same_context_returns_the_same_record_and_writes_nothing(
 def test_replaying_with_a_different_context_conflicts_and_writes_nothing(
         store, db_path, overrides, fields):
     mission_id = make_mission(store)
-    first = store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION)
+    first = store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION, GOAL)
     before = dump(db_path)
 
     with pytest.raises(DispatchContextConflict) as excinfo:
-        store.prepare_step_dispatch(mission_id, 'checkpoint_a', replay_with(**overrides))
+        store.prepare_step_dispatch(mission_id, 'checkpoint_a', replay_with(**overrides), GOAL)
 
     assert excinfo.value.fields == fields
     assert (excinfo.value.mission_id, excinfo.value.step_key) == (mission_id, 'checkpoint_a')
@@ -675,14 +702,14 @@ def test_replaying_with_a_different_context_conflicts_and_writes_nothing(
 
 def test_a_bound_context_is_never_replaced_by_repeated_conflicting_replays(store, db_path):
     mission_id = make_mission(store)
-    store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION)
+    store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION, GOAL)
     before = dump(db_path)
 
     for _, overrides, _ in DIFFERENT_CONTEXTS:
         with pytest.raises(DispatchContextConflict):
-            store.prepare_step_dispatch(mission_id, 'checkpoint_a', replay_with(**overrides))
+            store.prepare_step_dispatch(mission_id, 'checkpoint_a', replay_with(**overrides), GOAL)
         # Not even after the same request comes back with the original context.
-        store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION)
+        store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION, GOAL)
 
     assert dump(db_path) == before
 
@@ -694,7 +721,7 @@ def test_a_replay_against_a_corrupt_context_reports_corruption_not_a_conflict(st
 
     for action in (ACTION, replay_with(action_name='/other')):
         with pytest.raises(CorruptDispatchContext) as excinfo:
-            store.prepare_step_dispatch(mission_id, 'checkpoint_a', action)
+            store.prepare_step_dispatch(mission_id, 'checkpoint_a', action, GOAL)
         assert not isinstance(excinfo.value, DispatchContextConflict)
 
     assert dump(db_path) == before
@@ -704,7 +731,8 @@ def test_the_conflict_error_names_fields_and_is_not_another_error(store):
     mission_id = make_mission(store, prepared=['checkpoint_a'])
 
     with pytest.raises(DispatchContextConflict) as excinfo:
-        store.prepare_step_dispatch(mission_id, 'checkpoint_a', replay_with(action_name='/x'))
+        store.prepare_step_dispatch(
+            mission_id, 'checkpoint_a', replay_with(action_name='/x'), GOAL)
 
     error = excinfo.value
     assert 'action_name' in str(error)
@@ -765,7 +793,7 @@ def test_replaying_preparation_of_an_unbound_step_reports_it_missing_and_writes_
                                   DIFFERENT_CONTEXTS]
         for action in actions:
             with pytest.raises(DispatchContextMissing) as excinfo:
-                store.prepare_step_dispatch(mission_id, key, action)
+                store.prepare_step_dispatch(mission_id, key, action, GOAL)
             assert (excinfo.value.mission_id, excinfo.value.step_key) == (mission_id, key)
 
         assert dump(db_path) == before
@@ -819,7 +847,7 @@ def test_a_migrated_row_and_a_row_whose_context_was_deleted_cannot_be_told_apart
             raw(path, 'PRAGMA user_version')))
         with MissionStore(path) as store:
             found = []
-            for operation in (lambda: store.prepare_step_dispatch(mission_id, key, ACTION),
+            for operation in (lambda: store.prepare_step_dispatch(mission_id, key, ACTION, GOAL),
                               lambda: store.authorize_step_send(mission_id, key),
                               lambda: store.get_dispatch_context(mission_id, key)):
                 with pytest.raises(Exception) as excinfo:
@@ -828,14 +856,14 @@ def test_a_migrated_row_and_a_row_whose_context_was_deleted_cannot_be_told_apart
             outcomes.append(found)
 
     # Nothing in the schema distinguishes them, so the supported code must not guess.
-    assert shapes[0] == shapes[1] == ([('DISPATCH_PREPARED',)], [(1,)], [(0,)], [(7,)])
+    assert shapes[0] == shapes[1] == ([('DISPATCH_PREPARED',)], [(1,)], [(0,)], [(8,)])
     assert outcomes[0] == outcomes[1] == [DispatchContextMissing] * 3
 
 
 def test_a_pending_step_of_a_migrated_mission_is_prepared_and_bound_normally(db_path):
     make_v3_database(db_path)
     with MissionStore(db_path) as store:
-        record = store.prepare_step_dispatch(V3_MAIN_ID, 'pending', ACTION)
+        record = store.prepare_step_dispatch(V3_MAIN_ID, 'pending', ACTION, GOAL)
 
         assert store.get_step(V3_MAIN_ID, 'pending').state is S.DISPATCH_PREPARED
         assert store.get_dispatch_context(V3_MAIN_ID, 'pending').dispatch_id == record.dispatch_id
@@ -862,7 +890,7 @@ def test_preparation_never_binds_a_context_to_a_step_that_has_progressed(
         # whatever context is offered.
         for action in (ACTION, replay_with(action_name='/other')):
             with pytest.raises(InvalidStateTransition):
-                store.prepare_step_dispatch(mission_id, key, action)
+                store.prepare_step_dispatch(mission_id, key, action, GOAL)
 
         assert dump(db_path) == before
         with pytest.raises(DispatchContextMissing):
@@ -968,7 +996,7 @@ def test_replaying_preparation_does_not_make_an_unbound_step_authorizable(store,
         with pytest.raises(DispatchContextMissing):
             store.authorize_step_send(mission_id, 'checkpoint_a')
         with pytest.raises(DispatchContextMissing):
-            store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION)
+            store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION, GOAL)
 
     assert dump(db_path) == before
     assert store.get_by_mission_id(mission_id).attempts_used == 0
@@ -1283,10 +1311,11 @@ def test_only_the_first_preparation_inserts_a_context():
     assert {name for name, function in inspect.getmembers(MissionStore, inspect.isfunction)
             if '_INSERT_CONTEXT' in inspect.getsource(function)} == {'prepare_step_dispatch'}
 
-    # Inside it, only on the path that also inserts the dispatch and moves the step: three
-    # statements, in that order, and none of them in the replay branch.
+    # Inside it, only on the path that also inserts the dispatch, the goal and moves the step:
+    # four statements, in that order, and none of them in the replay branch.
     tree, names = names_in(MissionStore.prepare_step_dispatch)
-    assert executed(tree) == ['_INSERT_DISPATCH', '_INSERT_CONTEXT', '_SET_STEP_STATE']
+    assert executed(tree) == [
+        '_INSERT_DISPATCH', '_INSERT_CONTEXT', '_INSERT_GOAL', '_SET_STEP_STATE']
     replay = [node for node in ast.walk(tree)
               if isinstance(node, ast.If) and ast.unparse(node.test) == 'new_state is step.state']
     assert len(replay) == 1
@@ -1379,22 +1408,22 @@ def legacy_rows(path, origin):
 ORIGINS = {'v1': make_v1_database, 'v2': make_v2_database, 'v3': make_v3_database}
 
 
-def test_a_fresh_database_is_created_at_version_7(db_path):
+def test_a_fresh_database_is_created_at_version_8(db_path):
     MissionStore(db_path).close()
 
-    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(8,)]
     assert table_names(db_path) == set(COLUMNS)
 
 
 @pytest.mark.parametrize('origin', list(ORIGINS))
-def test_every_older_database_migrates_to_version_7_without_changing_a_row(
+def test_every_older_database_migrates_to_version_8_without_changing_a_row(
         db_path, tmp_path, origin):
     ORIGINS[origin](db_path)
     before = legacy_rows(db_path, origin)
 
     MissionStore(db_path).close()
 
-    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(8,)]
     assert legacy_rows(db_path, origin) == before
     assert table_names(db_path) == set(COLUMNS)
     # No context was made up for a dispatch that has none.
@@ -1405,6 +1434,8 @@ def test_every_older_database_migrates_to_version_7_without_changing_a_row(
     assert raw(db_path, 'SELECT COUNT(*) FROM recovery_evidence') == [(0,)]
     # And no reconciliation context, for a mission that was already reconciling.
     assert raw(db_path, 'SELECT COUNT(*) FROM mission_reconciliation_contexts') == [(0,)]
+    # And no goal specification, for a dispatch prepared before this table existed.
+    assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_goals') == [(0,)]
     MissionStore(tmp_path / 'fresh.db').close()
     assert schema_of(db_path) == schema_of(tmp_path / 'fresh.db')
 
@@ -1422,7 +1453,7 @@ def test_migrated_dispatches_keep_every_cell_and_gain_no_context(db_path):
     assert dump(db_path)['dispatch_contexts'] == []
 
 
-def test_the_version_3_migration_only_creates_the_four_tables(monkeypatch, db_path):
+def test_the_version_3_migration_only_creates_the_five_tables(monkeypatch, db_path):
     make_v3_database(db_path)
 
     store, connection = open_faulty_store(monkeypatch, db_path)
@@ -1430,23 +1461,25 @@ def test_the_version_3_migration_only_creates_the_four_tables(monkeypatch, db_pa
 
     statements = connection.statements
     changing = writes(statements)
-    assert len(changing) == 4
+    assert len(changing) == 5
     assert changing[0].startswith('CREATE TABLE dispatch_contexts (')
     assert changing[1].startswith('CREATE TABLE dispatch_authorizations (')
     assert changing[2].startswith('CREATE TABLE recovery_evidence (')
     assert changing[3].startswith('CREATE TABLE mission_reconciliation_contexts (')
+    assert changing[4].startswith('CREATE TABLE dispatch_goals (')
     # No table was rebuilt: nothing dropped, renamed, altered, copied or filled.
     assert not [sql for sql in statements if sql.split()[0] in ('ALTER', 'DROP', 'INSERT')]
-    # Versions 4, 5 and 6 are never committed on the way: the one write of the version is the last.
+    # Versions 4, 5, 6 and 7 are never committed on the way: the one write of the version is last.
     assert 'PRAGMA user_version = 4' not in statements
     assert 'PRAGMA user_version = 5' not in statements
     assert 'PRAGMA user_version = 6' not in statements
-    assert statements.count('PRAGMA user_version = 7') == 1
-    assert (statements.index(changing[3]) < statements.index('PRAGMA user_version = 7')
+    assert 'PRAGMA user_version = 7' not in statements
+    assert statements.count('PRAGMA user_version = 8') == 1
+    assert (statements.index(changing[4]) < statements.index('PRAGMA user_version = 8')
             < statements.index('COMMIT'))
 
 
-def test_reopening_a_version_7_database_changes_nothing(monkeypatch, db_path):
+def test_reopening_a_version_8_database_changes_nothing(monkeypatch, db_path):
     make_v3_database(db_path)
     MissionStore(db_path).close()
     before = (dump(db_path), schema_of(db_path))
@@ -1456,7 +1489,7 @@ def test_reopening_a_version_7_database_changes_nothing(monkeypatch, db_path):
 
     assert (dump(db_path), schema_of(db_path)) == before
     assert writes(connection.statements) == []
-    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(8,)]
 
 
 def test_concurrent_opens_of_a_version_3_database_migrate_it_once(tmp_path):
@@ -1475,12 +1508,13 @@ def test_concurrent_opens_of_a_version_3_database_migrate_it_once(tmp_path):
             for future in [pool.submit(open_and_close) for _ in range(workers)]:
                 future.result(timeout=TIMEOUT)
 
-        assert raw(path, 'PRAGMA user_version') == [(7,)]
+        assert raw(path, 'PRAGMA user_version') == [(8,)]
         assert dump(path, V3_TABLES) == before
         assert raw(path, 'SELECT COUNT(*) FROM dispatch_contexts') == [(0,)]
         assert raw(path, 'SELECT COUNT(*) FROM dispatch_authorizations') == [(0,)]
         assert raw(path, 'SELECT COUNT(*) FROM recovery_evidence') == [(0,)]
         assert raw(path, 'SELECT COUNT(*) FROM mission_reconciliation_contexts') == [(0,)]
+        assert raw(path, 'SELECT COUNT(*) FROM dispatch_goals') == [(0,)]
         MissionStore(tmp_path / f'fresh-{round_index}.db').close()
         assert schema_of(path) == schema_of(tmp_path / f'fresh-{round_index}.db')
 
@@ -1498,7 +1532,7 @@ def assert_still_version_3(db_path, before, schema):
 
 @pytest.mark.parametrize('failing', [
     'create the context table', 'create the authorization table', 'create the evidence table',
-    'create the reconciliation table', 'set the version', 'commit'])
+    'create the reconciliation table', 'create the goal table', 'set the version', 'commit'])
 def test_a_failure_while_migrating_from_version_3_rolls_back_cleanly(
         monkeypatch, db_path, failing):
     make_v3_database(db_path)
@@ -1511,6 +1545,7 @@ def test_a_failure_while_migrating_from_version_3_rolls_back_cleanly(
             'create the authorization table': '_DISPATCH_AUTHORIZATIONS_DDL',
             'create the evidence table': '_RECOVERY_EVIDENCE_DDL',
             'create the reconciliation table': '_MISSION_RECONCILIATION_CONTEXTS_DDL',
+            'create the goal table': '_DISPATCH_GOALS_DDL',
         }[failing]
         with monkeypatch.context() as patch:
             patch.setattr(storage, ddl, 'THIS IS NOT SQL')
@@ -1518,7 +1553,7 @@ def test_a_failure_while_migrating_from_version_3_rolls_back_cleanly(
                 MissionStore(db_path)
     else:
         fails = {
-            'set the version': lambda sql: sql.strip() == 'PRAGMA user_version = 7',
+            'set the version': lambda sql: sql.strip() == 'PRAGMA user_version = 8',
             'commit': lambda sql: sql.strip().upper() == 'COMMIT',
         }[failing]
         with pytest.raises(sqlite3.OperationalError, match='injected failure'):
@@ -1528,14 +1563,14 @@ def test_a_failure_while_migrating_from_version_3_rolls_back_cleanly(
     # A later, healthy open finishes the migration.
     with MissionStore(db_path):
         pass
-    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(8,)]
     assert dump(db_path, V3_TABLES) == before
 
 
 @pytest.mark.parametrize('origin', ['v1', 'v2'])
 @pytest.mark.parametrize('ddl', [
     '_DISPATCH_CONTEXTS_DDL', '_DISPATCH_AUTHORIZATIONS_DDL', '_RECOVERY_EVIDENCE_DDL',
-    '_MISSION_RECONCILIATION_CONTEXTS_DDL'])
+    '_MISSION_RECONCILIATION_CONTEXTS_DDL', '_DISPATCH_GOALS_DDL'])
 def test_a_failure_at_a_late_step_leaves_an_older_database_at_its_own_version(
         monkeypatch, db_path, origin, ddl):
     ORIGINS[origin](db_path)
@@ -1567,17 +1602,20 @@ PREPARE_STAGES = {
     'read the dispatch': lambda sql: sql.startswith('SELECT') and 'FROM STEP_DISPATCHES' in sql,
     'insert the dispatch': lambda sql: sql.startswith('INSERT INTO STEP_DISPATCHES'),
     'insert the context': lambda sql: sql.startswith('INSERT INTO DISPATCH_CONTEXTS'),
+    'insert the goal': lambda sql: sql.startswith('INSERT INTO DISPATCH_GOALS'),
     'update the step': lambda sql: sql.startswith('UPDATE MISSION_STEPS'),
     'commit': lambda sql: sql == 'COMMIT',
 }
 
 # What must already have run when a later stage fails: the rollback, not an early exit, is
-# what leaves no part of the trio behind.
+# what leaves no part of the quartet behind.
 PREPARE_RAN_BEFORE = {
     'insert the context': ['INSERT INTO STEP_DISPATCHES'],
-    'update the step': ['INSERT INTO STEP_DISPATCHES', 'INSERT INTO DISPATCH_CONTEXTS'],
+    'insert the goal': ['INSERT INTO STEP_DISPATCHES', 'INSERT INTO DISPATCH_CONTEXTS'],
+    'update the step': ['INSERT INTO STEP_DISPATCHES', 'INSERT INTO DISPATCH_CONTEXTS',
+                        'INSERT INTO DISPATCH_GOALS'],
     'commit': ['INSERT INTO STEP_DISPATCHES', 'INSERT INTO DISPATCH_CONTEXTS',
-               'UPDATE MISSION_STEPS'],
+               'INSERT INTO DISPATCH_GOALS', 'UPDATE MISSION_STEPS'],
 }
 
 
@@ -1592,7 +1630,7 @@ def test_a_failure_before_the_commit_leaves_none_of_the_uuid_the_context_or_the_
         connection.fail_when = lambda sql: PREPARE_STAGES[stage](normalized(sql))
 
         with pytest.raises(sqlite3.OperationalError, match='injected failure'):
-            store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION)
+            store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION, GOAL)
 
         connection.fail_when = None
         assert not connection.in_transaction
@@ -1600,14 +1638,15 @@ def test_a_failure_before_the_commit_leaves_none_of_the_uuid_the_context_or_the_
         assert any(PREPARE_STAGES[stage](sql) for sql in logged), 'the stage was never reached'
         for prefix in PREPARE_RAN_BEFORE.get(stage, []):
             assert any(sql.startswith(prefix) for sql in logged)
-        # No dispatch, no context and no PREPARED, not a partial trio.
+        # No dispatch, no context, no goal and no PREPARED, not a partial quartet.
         assert dump(db_path) == before
         assert raw(db_path, 'SELECT COUNT(*) FROM step_dispatches') == [(0,)]
         assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_contexts') == [(0,)]
+        assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_goals') == [(0,)]
         assert store.get_step(mission_id, 'checkpoint_a').state is S.PENDING
 
         # And the store still works: all three commit together on the retry.
-        record = store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION)
+        record = store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION, GOAL)
         assert store.get_dispatch_context(mission_id, 'checkpoint_a').dispatch_id == (
             record.dispatch_id)
 
@@ -1621,7 +1660,7 @@ def commit_then_fail(connection):
     return fail_after_committing
 
 
-def test_an_error_after_a_successful_commit_leaves_all_three_and_a_replay_finds_them(
+def test_an_error_after_a_successful_commit_leaves_all_four_and_a_replay_finds_them(
         monkeypatch, db_path):
     store, connection = open_faulty_store(monkeypatch, db_path)
     with store:
@@ -1629,18 +1668,21 @@ def test_an_error_after_a_successful_commit_leaves_all_three_and_a_replay_finds_
         connection.fail_when = commit_then_fail(connection)
 
         with pytest.raises(sqlite3.OperationalError, match='injected failure'):
-            store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION)
+            store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION, GOAL)
         connection.fail_when = None
 
         assert store.get_step(mission_id, 'checkpoint_a').state is S.DISPATCH_PREPARED
         assert raw(db_path, 'SELECT COUNT(*) FROM step_dispatches') == [(1,)]
         assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_contexts') == [(1,)]
+        assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_goals') == [(1,)]
         bound = store.get_dispatch_context(mission_id, 'checkpoint_a')
-        assert store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION).dispatch_id == (
-            bound.dispatch_id)
+        replayed = store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION, GOAL)
+        assert replayed.dispatch_id == bound.dispatch_id
         with pytest.raises(DispatchContextConflict):
-            store.prepare_step_dispatch(mission_id, 'checkpoint_a', replay_with(action_name='/x'))
+            store.prepare_step_dispatch(
+                mission_id, 'checkpoint_a', replay_with(action_name='/x'), GOAL)
         assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_contexts') == [(1,)]
+        assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_goals') == [(1,)]
 
 
 # Crashes. A real child process is killed at a chosen point in the real code.
@@ -1652,6 +1694,7 @@ import sqlite3
 import sys
 
 from task_resilience import storage
+from task_resilience.model import ExpectedGoalSpecification
 from task_resilience.reconciliation import ExpectedActionContext
 from task_resilience.storage import MissionStore
 
@@ -1693,7 +1736,8 @@ armed = True
 action = ExpectedActionContext(
     action_name='/navigate_to_pose', action_type='nav2_msgs/action/NavigateToPose',
     robot_namespace='/robot1')
-record = store.prepare_step_dispatch(mission_id, step_key, action)
+goal = ExpectedGoalSpecification(goal_format='test/goal/v1', payload={'target': 'checkpoint-a'})
+record = store.prepare_step_dispatch(mission_id, step_key, action, goal)
 print(record.dispatch_id, flush=True)
 die()
 """
@@ -1714,6 +1758,8 @@ FRESH_KILLS = [
     ('INSERT INTO STEP_DISPATCHES', 'after', 'exit', False),
     ('INSERT INTO DISPATCH_CONTEXTS', 'before', 'exit', False),
     ('INSERT INTO DISPATCH_CONTEXTS', 'after', 'exit', False),
+    ('INSERT INTO DISPATCH_GOALS', 'before', 'exit', False),
+    ('INSERT INTO DISPATCH_GOALS', 'after', 'exit', False),
     ('UPDATE MISSION_STEPS', 'before', 'exit', False),
     ('UPDATE MISSION_STEPS', 'after', 'exit', False),
     ('COMMIT', 'before', 'exit', False),
@@ -1724,7 +1770,7 @@ FRESH_KILLS = [
 
 
 @pytest.mark.parametrize(('marker', 'when', 'how', 'survives'), FRESH_KILLS)
-def test_a_process_killed_around_a_fresh_preparation_leaves_all_three_or_none(
+def test_a_process_killed_around_a_fresh_preparation_leaves_all_four_or_none(
         db_path, marker, when, how, survives):
     with MissionStore(db_path) as store:
         mission_id = make_mission(store)
@@ -1736,25 +1782,27 @@ def test_a_process_killed_around_a_fresh_preparation_leaves_all_three_or_none(
     assert child.stdout == ''
     with MissionStore(db_path) as reopened:
         if not survives:
-            # SQLite rolled the unfinished transaction back: not a UUID alone, not a context
-            # alone, and not a PREPARED step without either.
+            # SQLite rolled the unfinished transaction back: not a UUID alone, not a context or
+            # a goal alone, and not a PREPARED step without all three.
             assert dump(db_path) == before
             assert reopened.get_step(mission_id, 'checkpoint_a').state is S.PENDING
-            record = reopened.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION)
+            record = reopened.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION, GOAL)
             assert reopened.get_dispatch_context(mission_id, 'checkpoint_a').dispatch_id == (
                 record.dispatch_id)
         else:
             assert reopened.get_step(mission_id, 'checkpoint_a').state is S.DISPATCH_PREPARED
             assert raw(db_path, 'SELECT COUNT(*) FROM step_dispatches') == [(1,)]
             assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_contexts') == [(1,)]
+            assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_goals') == [(1,)]
             found = reopened.get_step_dispatch(mission_id, 'checkpoint_a')
             assert reopened.get_dispatch_context(mission_id, 'checkpoint_a') == (
                 DispatchContextRecord(
                     dispatch_id=found.dispatch_id, mission_id=mission_id,
                     step_key='checkpoint_a', action_name='/navigate_to_pose',
                     action_type='nav2_msgs/action/NavigateToPose', robot_namespace='/robot1'))
-            # A replay finds the same identity and the same context.
-            assert reopened.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION) == found
+            # A replay finds the same identity, the same context and the same goal.
+            replayed = reopened.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION, GOAL)
+            assert replayed == found
             assert reopened.get_by_mission_id(mission_id).attempts_used == 0
 
 
@@ -1790,7 +1838,7 @@ def race_missions(db_path, prepared):
 
 def try_prepare(store, mission_id, action):
     try:
-        return store.prepare_step_dispatch(mission_id, 'checkpoint', action)
+        return store.prepare_step_dispatch(mission_id, 'checkpoint', action, GOAL)
     except DispatchContextConflict as conflict:
         return conflict
 
@@ -1845,7 +1893,7 @@ def test_concurrent_replays_and_authorizations_of_unbound_steps_all_report_the_c
         try:
             if worker < 6:
                 return store.prepare_step_dispatch(
-                    mission_ids[n], 'checkpoint', contexts[worker % 2])
+                    mission_ids[n], 'checkpoint', contexts[worker % 2], GOAL)
             return store.authorize_step_send(mission_ids[n], 'checkpoint')
         except DispatchContextMissing as refusal:
             return refusal

@@ -33,6 +33,7 @@ from task_resilience.errors import (
     InvalidStateTransition,
     MissionCompletionInvariantError,
 )
+from task_resilience.model import ExpectedGoalSpecification
 from task_resilience.reconciliation import ExpectedActionContext
 from task_resilience.state_machine import MissionState, StepState
 from task_resilience.storage import MissionStore
@@ -41,6 +42,9 @@ from task_resilience.storage import MissionStore
 ACTION = ExpectedActionContext(
     action_name='/navigate_to_pose', action_type='nav2_msgs/action/NavigateToPose',
     robot_namespace='/robot1')
+
+GOAL = ExpectedGoalSpecification(
+    goal_format='test/goal/v1', payload={'target': 'checkpoint-a'})
 
 # The schema exactly as Task 002 created it.
 V1_SCHEMA = """
@@ -148,7 +152,7 @@ def test_version_1_database_migrates_when_opened(db_path):
 
     MissionStore(db_path).close()
 
-    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(8,)]
     assert v1_snapshot(db_path) == before
 
 
@@ -190,7 +194,7 @@ def test_empty_version_1_database_migrates(db_path):
 
     MissionStore(db_path).close()
 
-    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(8,)]
     assert raw(db_path, 'SELECT COUNT(*) FROM missions') == [(0,)]
 
 
@@ -213,8 +217,8 @@ def test_consumed_attempts_survive_migration(db_path):
         for mission_id in (LEGACY[0]['mission_id'], LEGACY[2]['mission_id']):
             store.initialize_steps(mission_id, ['checkpoint_a', 'return_to_base'])
             store.transition_mission_state(mission_id, MissionState.RUNNING)
-            store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION)
-            store.prepare_step_dispatch(mission_id, 'return_to_base', ACTION)
+            store.prepare_step_dispatch(mission_id, 'checkpoint_a', ACTION, GOAL)
+            store.prepare_step_dispatch(mission_id, 'return_to_base', ACTION, GOAL)
 
         # A legacy mission continues from its count: 2 used of 3 leaves one send.
         first = store.authorize_step_send(LEGACY[0]['mission_id'], 'checkpoint_a')
@@ -258,7 +262,7 @@ def test_new_apis_work_on_a_migrated_mission(db_path):
             store.transition_mission_state(mission_id, MissionState.COMPLETED)
 
         for key in ('checkpoint_a', 'return_to_base'):
-            store.prepare_step_dispatch(mission_id, key, ACTION)
+            store.prepare_step_dispatch(mission_id, key, ACTION, GOAL)
             store.authorize_step_send(mission_id, key)
             store.transition_step_state(mission_id, key, StepState.SUCCEEDED)
         completed = store.transition_mission_state(mission_id, MissionState.COMPLETED)
@@ -291,7 +295,7 @@ def test_concurrent_opens_of_a_version_1_database_migrate_it_once(db_path):
         for future in [pool.submit(open_and_close) for _ in range(workers)]:
             future.result(timeout=10)
 
-    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(8,)]
     assert v1_snapshot(db_path) == before
     assert raw(db_path, 'SELECT DISTINCT mission_state FROM missions') == [('ACCEPTED',)]
 
@@ -308,7 +312,8 @@ def test_concurrent_opens_of_a_version_1_database_migrate_it_once(db_path):
     '_DISPATCH_CONTEXTS_DDL',  # after all of version 3 exists: the step to version 4
     '_DISPATCH_AUTHORIZATIONS_DDL',  # after all of version 4 exists: the step to version 5
     '_RECOVERY_EVIDENCE_DDL',  # after all of version 5 exists: the step to version 6
-    '_MISSION_RECONCILIATION_CONTEXTS_DDL',  # after all of version 6 exists: the last step
+    '_MISSION_RECONCILIATION_CONTEXTS_DDL',  # after all of version 6 exists: the step to version 7
+    '_DISPATCH_GOALS_DDL',  # after all of version 7 exists: the last step
 ])
 def test_migration_failing_partway_leaves_the_version_1_database_intact(
         db_path, monkeypatch, statement):
@@ -327,7 +332,7 @@ def test_migration_failing_partway_leaves_the_version_1_database_intact(
     # A later, healthy open picks the migration up again.
     with MissionStore(db_path) as store:
         assert store.get_by_mission_id(LEGACY[0]['mission_id']).state is MissionState.ACCEPTED
-    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(8,)]
 
 
 class FailingCommit:
@@ -354,7 +359,7 @@ def test_failed_commit_cannot_leave_a_new_version_with_a_partial_schema(db_path,
     real_connect = sqlite3.connect
 
     with monkeypatch.context() as patch:
-        # Every statement, including PRAGMA user_version = 7, has run by now.
+        # Every statement, including PRAGMA user_version = 8, has run by now.
         patch.setattr(
             storage.sqlite3, 'connect', lambda *a, **kw: FailingCommit(real_connect(*a, **kw)))
         with pytest.raises(sqlite3.OperationalError, match='injected commit failure'):
@@ -367,7 +372,7 @@ def test_failed_commit_cannot_leave_a_new_version_with_a_partial_schema(db_path,
 
     with MissionStore(db_path):
         pass
-    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(8,)]
 
 
 # Version 2 databases
@@ -506,17 +511,18 @@ def assert_still_version_2(path, expected_snapshot, expected_schema):
     assert schema_of(path) == expected_schema
 
 
-def test_version_2_database_migrates_to_version_7_when_opened(db_path):
+def test_version_2_database_migrates_to_version_8_when_opened(db_path):
     make_v2_database(db_path)
     before = v2_snapshot(db_path)
 
     MissionStore(db_path).close()
 
-    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(8,)]
     assert v2_snapshot(db_path) == before
     assert table_names(db_path) == {
         'missions', 'mission_steps', 'step_dispatches', 'dispatch_contexts',
-        'dispatch_authorizations', 'recovery_evidence', 'mission_reconciliation_contexts'}
+        'dispatch_authorizations', 'recovery_evidence', 'mission_reconciliation_contexts',
+        'dispatch_goals'}
 
 
 def test_migrated_version_2_states_and_attempts_are_unchanged(db_path):
@@ -563,7 +569,7 @@ def test_a_version_2_step_already_prepared_migrates_unchanged_and_gets_no_identi
         # Not repaired: preparation refuses rather than making an identity up,
         # and a plain transition cannot make one either.
         with pytest.raises(CorruptDispatchRecord):
-            store.prepare_step_dispatch(RECONCILING_ID, 'prepared_step', ACTION)
+            store.prepare_step_dispatch(RECONCILING_ID, 'prepared_step', ACTION, GOAL)
         with pytest.raises(DispatchPreparationRequired):
             store.transition_step_state(
                 RECONCILING_ID, 'prepared_step', StepState.DISPATCH_PREPARED)
@@ -633,7 +639,7 @@ def test_a_migrated_succeeded_step_without_a_dispatch_still_counts_toward_comple
         assert excinfo.value.step_states == (StepState.SUCCEEDED, StepState.PENDING)
 
         # The pending step is finished natively, with a dispatch of its own.
-        store.prepare_step_dispatch(RUNNING_ID, 'return_to_base', ACTION)
+        store.prepare_step_dispatch(RUNNING_ID, 'return_to_base', ACTION, GOAL)
         store.authorize_step_send(RUNNING_ID, 'return_to_base')
         for state in (StepState.ACCEPTED, StepState.EXECUTING, StepState.SUCCEEDED):
             store.transition_step_state(RUNNING_ID, 'return_to_base', state)
@@ -650,7 +656,7 @@ def test_a_native_step_in_a_migrated_mission_progresses_normally(db_path):
 
     with MissionStore(db_path) as store:
         # A step of a migrated mission that is still PENDING is fully native from here.
-        prepared = store.prepare_step_dispatch(RUNNING_ID, 'return_to_base', ACTION)
+        prepared = store.prepare_step_dispatch(RUNNING_ID, 'return_to_base', ACTION, GOAL)
         store.authorize_step_send(RUNNING_ID, 'return_to_base')
         assert store.get_step(RUNNING_ID, 'return_to_base').state is StepState.DISPATCHED
         for state in (StepState.ACCEPTED, StepState.EXECUTING):
@@ -671,17 +677,17 @@ def test_dispatch_preparation_works_on_a_migrated_version_2_database(db_path):
     make_v2_database(db_path)
 
     with MissionStore(db_path) as store:
-        record = store.prepare_step_dispatch(RUNNING_ID, 'return_to_base', ACTION)
+        record = store.prepare_step_dispatch(RUNNING_ID, 'return_to_base', ACTION, GOAL)
         assert store.get_step(RUNNING_ID, 'return_to_base').state is StepState.DISPATCH_PREPARED
         assert store.get_step_dispatch(RUNNING_ID, 'return_to_base') == record
 
         # A finished step cannot be prepared.
         with pytest.raises(InvalidStateTransition):
-            store.prepare_step_dispatch(RUNNING_ID, 'checkpoint_a', ACTION)
+            store.prepare_step_dispatch(RUNNING_ID, 'checkpoint_a', ACTION, GOAL)
         # A version 2 step that was already prepared has no identity to return,
         # and none is made up for it.
         with pytest.raises(CorruptDispatchRecord):
-            store.prepare_step_dispatch(RECONCILING_ID, 'prepared_step', ACTION)
+            store.prepare_step_dispatch(RECONCILING_ID, 'prepared_step', ACTION, GOAL)
 
     assert raw(db_path, 'SELECT COUNT(*) FROM step_dispatches') == [(1,)]
 
@@ -691,7 +697,7 @@ def test_existing_apis_keep_working_on_a_migrated_version_2_database(db_path):
 
     with MissionStore(db_path) as store:
         # RUNNING_ID has used 1 of its 3 attempts; the next send is the second.
-        store.prepare_step_dispatch(RUNNING_ID, 'return_to_base', ACTION)
+        store.prepare_step_dispatch(RUNNING_ID, 'return_to_base', ACTION, GOAL)
         assert store.authorize_step_send(RUNNING_ID, 'return_to_base').attempt_number == 2
         store.transition_step_state(RUNNING_ID, 'return_to_base', StepState.CANCELLED)
         with pytest.raises(MissionCompletionInvariantError):
@@ -715,7 +721,7 @@ def test_concurrent_opens_of_a_version_2_database_migrate_it_once(db_path):
         for future in [pool.submit(open_and_close) for _ in range(workers)]:
             future.result(timeout=10)
 
-    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(8,)]
     assert v2_snapshot(db_path) == before
 
 
@@ -732,7 +738,7 @@ def test_a_failed_version_2_migration_leaves_the_database_at_version_2(db_path, 
     assert_still_version_2(db_path, before, schema)
     with MissionStore(db_path):
         pass
-    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(8,)]
 
 
 def test_a_failed_commit_leaves_a_version_2_database_at_version_2(db_path, monkeypatch):
@@ -765,7 +771,8 @@ def test_a_version_1_open_is_one_transaction_and_never_commits_an_intermediate_v
     assert 'PRAGMA user_version = 4' not in statements
     assert 'PRAGMA user_version = 5' not in statements
     assert 'PRAGMA user_version = 6' not in statements
-    assert statements.count('PRAGMA user_version = 7') == 1
+    assert 'PRAGMA user_version = 7' not in statements
+    assert statements.count('PRAGMA user_version = 8') == 1
     # The whole chain, every step, ran before the single commit.
     assert (statements.index('ALTER TABLE missions RENAME TO missions_v1')
             < next(i for i, sql in enumerate(statements)
@@ -778,7 +785,9 @@ def test_a_version_1_open_is_one_transaction_and_never_commits_an_intermediate_v
                    if sql.startswith('CREATE TABLE recovery_evidence'))
             < next(i for i, sql in enumerate(statements)
                    if sql.startswith('CREATE TABLE mission_reconciliation_contexts'))
-            < statements.index('PRAGMA user_version = 7')
+            < next(i for i, sql in enumerate(statements)
+                   if sql.startswith('CREATE TABLE dispatch_goals'))
+            < statements.index('PRAGMA user_version = 8')
             < statements.index('COMMIT'))
 
 
@@ -789,7 +798,7 @@ def test_a_version_1_migration_failing_at_the_last_step_leaves_version_1_not_an_
     schema = schema_of(db_path)
 
     with monkeypatch.context() as patch:
-        patch.setattr(storage, '_MISSION_RECONCILIATION_CONTEXTS_DDL', 'THIS IS NOT SQL')
+        patch.setattr(storage, '_DISPATCH_GOALS_DDL', 'THIS IS NOT SQL')
         with pytest.raises(sqlite3.OperationalError):
             MissionStore(db_path)
 

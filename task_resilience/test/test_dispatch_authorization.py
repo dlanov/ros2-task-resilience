@@ -47,6 +47,7 @@ from task_resilience.errors import (
     CorruptDispatchRecord,
     DispatchAuthorizationMissing,
     DispatchContextMissing,
+    DispatchGoalMissing,
     DispatchNotFound,
     DispatchPreparationRequired,
     InvalidStateTransition,
@@ -57,7 +58,11 @@ from task_resilience.errors import (
     StepNotAwaitingSend,
     StepNotFound,
 )
-from task_resilience.model import DispatchAuthorizationRecord, SendAuthorization
+from task_resilience.model import (
+    DispatchAuthorizationRecord,
+    ExpectedGoalSpecification,
+    SendAuthorization,
+)
 from task_resilience.state_machine import MissionState, StepState, transition_step
 from task_resilience.storage import MissionStore
 from test_dispatch_context import (
@@ -79,6 +84,9 @@ ACTION = reconciliation.ExpectedActionContext(
     action_name='/navigate_to_pose', action_type='nav2_msgs/action/NavigateToPose',
     robot_namespace='/robot1')
 
+GOAL = ExpectedGoalSpecification(
+    goal_format='test/goal/v1', payload={'target': 'checkpoint-a'})
+
 M = MissionState
 S = StepState
 
@@ -88,7 +96,7 @@ KEYS = ['checkpoint_a', 'return_to_base']
 ROUNDS = 25
 TIMEOUT = 10
 
-# The tables as version 7 defines them, written out here so a new column or table shows up.
+# The tables as version 8 defines them, written out here so a new column or table shows up.
 COLUMNS = {
     'missions': [
         'mission_id', 'request_id', 'request_fingerprint', 'request_json', 'max_attempts',
@@ -106,6 +114,7 @@ COLUMNS = {
         'recorded_at',
     ],
     'mission_reconciliation_contexts': ['mission_id', 'resume_state'],
+    'dispatch_goals': ['dispatch_id', 'goal_format', 'goal_json', 'goal_fingerprint'],
 }
 V4_TABLES = ['missions', 'mission_steps', 'step_dispatches', 'dispatch_contexts']
 V5_TABLES = [*V4_TABLES, 'dispatch_authorizations']
@@ -281,7 +290,7 @@ def make_mission(store, request_id='req-001', max_attempts=3, keys=KEYS, prepare
     mission = store.create_or_get(request_id, {'goal': 'demo'}, max_attempts)
     store.initialize_steps(mission.mission_id, keys)
     for key in prepared:
-        store.prepare_step_dispatch(mission.mission_id, key, ACTION)
+        store.prepare_step_dispatch(mission.mission_id, key, ACTION, GOAL)
     for state in route:
         store.transition_mission_state(mission.mission_id, state)
     return mission.mission_id
@@ -333,18 +342,18 @@ def file_digest(path):
 
 # A. The schema
 
-def test_the_schema_is_exactly_version_7_and_version_5_added_one_table(db_path):
+def test_the_schema_is_exactly_version_8_and_version_5_added_one_table(db_path):
     MissionStore(db_path).close()
 
-    assert storage.SCHEMA_VERSION == 7
-    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
+    assert storage.SCHEMA_VERSION == 8
+    assert raw(db_path, 'PRAGMA user_version') == [(8,)]
     assert table_names(db_path) == set(COLUMNS)
-    # Version 5 added the authorization table to version 4's, version 6 the evidence table and
-    # version 7 the reconciliation table.
+    # Version 5 added the authorization table to version 4's, version 6 the evidence table,
+    # version 7 the reconciliation table and version 8 the goal table.
     assert set(V5_TABLES) - set(V4_TABLES) == {NEW_TABLE}
-    assert len(COLUMNS) == len(V5_TABLES) + 2
+    assert len(COLUMNS) == len(V5_TABLES) + 3
     assert set(COLUMNS) - set(V5_TABLES) == {
-        'recovery_evidence', 'mission_reconciliation_contexts'}
+        'recovery_evidence', 'mission_reconciliation_contexts', 'dispatch_goals'}
     for table, columns in COLUMNS.items():
         assert [row[1] for row in raw(db_path, f'PRAGMA table_info({table})')] == columns
 
@@ -612,8 +621,8 @@ def test_the_record_survives_every_ordinary_step_state_unchanged(store, db_path,
 def test_preparing_replaying_and_cancelling_never_write_a_record(store, db_path):
     mission_id = make_mission(store, prepared=[])
     for key in KEYS:
-        store.prepare_step_dispatch(mission_id, key, ACTION)
-        store.prepare_step_dispatch(mission_id, key, ACTION)
+        store.prepare_step_dispatch(mission_id, key, ACTION, GOAL)
+        store.prepare_step_dispatch(mission_id, key, ACTION, GOAL)
     store.transition_step_state(mission_id, 'checkpoint_a', S.CANCELLED)
     store.transition_step_state(mission_id, 'return_to_base', S.FAILED)
     store.transition_mission_state(mission_id, M.FAILED)
@@ -1369,7 +1378,7 @@ ORIGINS = {
 VERSION_OF = {'v1': 1, 'v2': 2, 'v3': 3, 'v4': 4, 'v5': 5, 'v6': 6}
 MIGRATIONS = [
     '_migrate_v1_to_v2', '_migrate_v2_to_v3', '_migrate_v3_to_v4', '_migrate_v4_to_v5',
-    '_migrate_v5_to_v6', '_migrate_v6_to_v7']
+    '_migrate_v5_to_v6', '_migrate_v6_to_v7', '_migrate_v7_to_v8']
 
 
 def old_rows(path, origin):
@@ -1390,30 +1399,32 @@ def fresh_schema(tmp_path):
 
 
 @pytest.mark.parametrize('origin', list(ORIGINS))
-def test_every_older_database_migrates_to_version_7_and_invents_no_record(
+def test_every_older_database_migrates_to_version_8_and_invents_no_record(
         db_path, tmp_path, origin):
     ORIGINS[origin](db_path)
     before = old_rows(db_path, origin)
 
     MissionStore(db_path).close()
 
-    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(8,)]
     assert old_rows(db_path, origin) == before
     assert table_names(db_path) == set(COLUMNS)
     assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_authorizations') == [(0,)]
     assert raw(db_path, 'SELECT COUNT(*) FROM recovery_evidence') == [(0,)]
     assert raw(db_path, 'SELECT COUNT(*) FROM mission_reconciliation_contexts') == [(0,)]
+    assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_goals') == [(0,)]
     assert schema_of(db_path) == fresh_schema(tmp_path)
 
 
-def test_a_fresh_database_is_created_at_version_7_with_no_record(db_path):
+def test_a_fresh_database_is_created_at_version_8_with_no_record(db_path):
     MissionStore(db_path).close()
 
-    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(8,)]
     assert table_names(db_path) == set(COLUMNS)
     assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_authorizations') == [(0,)]
     assert raw(db_path, 'SELECT COUNT(*) FROM recovery_evidence') == [(0,)]
     assert raw(db_path, 'SELECT COUNT(*) FROM mission_reconciliation_contexts') == [(0,)]
+    assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_goals') == [(0,)]
 
 
 @pytest.mark.parametrize(('origin', 'expected'), [
@@ -1458,7 +1469,7 @@ def test_a_current_or_fresh_database_runs_no_migration_step(monkeypatch, db_path
     assert called == []
 
 
-def test_the_version_4_migration_is_three_create_tables_and_only_the_last_version(
+def test_the_version_4_migration_is_four_create_tables_and_only_the_last_version(
         monkeypatch, db_path):
     make_v4_database(db_path)
 
@@ -1467,23 +1478,25 @@ def test_the_version_4_migration_is_three_create_tables_and_only_the_last_versio
 
     statements = connection.statements
     changing = writes(statements)
-    # The step to version 5 is still exactly one CREATE TABLE, and the steps to versions 6 and 7
-    # one more each.
-    assert len(changing) == 3
+    # The step to version 5 is still exactly one CREATE TABLE, and the steps to versions 6, 7
+    # and 8 one more each.
+    assert len(changing) == 4
     assert changing[0].startswith('CREATE TABLE dispatch_authorizations (')
     assert changing[1].startswith('CREATE TABLE recovery_evidence (')
     assert changing[2].startswith('CREATE TABLE mission_reconciliation_contexts (')
+    assert changing[3].startswith('CREATE TABLE dispatch_goals (')
     # No table was rebuilt: nothing dropped, renamed, altered, copied or filled, and the
     # version 3 step, which would fail on a native version 4 database, was not run.
     assert not [sql for sql in statements if sql.split()[0] in ('ALTER', 'DROP', 'INSERT')]
     assert not [sql for sql in statements if sql.startswith('CREATE TABLE dispatch_contexts')]
     assert statements.count('BEGIN IMMEDIATE') == 1
     assert statements.count('COMMIT') == 1
-    # Versions 5 and 6 are never committed on the way.
+    # Versions 5, 6 and 7 are never committed on the way.
     assert 'PRAGMA user_version = 5' not in statements
     assert 'PRAGMA user_version = 6' not in statements
-    assert statements.count('PRAGMA user_version = 7') == 1
-    assert (statements.index(changing[2]) < statements.index('PRAGMA user_version = 7')
+    assert 'PRAGMA user_version = 7' not in statements
+    assert statements.count('PRAGMA user_version = 8') == 1
+    assert (statements.index(changing[3]) < statements.index('PRAGMA user_version = 8')
             < statements.index('COMMIT'))
 
 
@@ -1498,7 +1511,7 @@ def test_reopening_a_migrated_database_changes_nothing(monkeypatch, db_path, ori
 
     assert writes(connection.statements) == []
     assert (dump(db_path), schema_of(db_path), file_digest(db_path)) == before
-    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(8,)]
 
 
 def test_concurrent_opens_of_a_version_4_database_migrate_it_once(tmp_path):
@@ -1517,11 +1530,12 @@ def test_concurrent_opens_of_a_version_4_database_migrate_it_once(tmp_path):
             for future in [pool.submit(open_and_close) for _ in range(workers)]:
                 future.result(timeout=TIMEOUT)
 
-        assert raw(path, 'PRAGMA user_version') == [(7,)]
+        assert raw(path, 'PRAGMA user_version') == [(8,)]
         assert dump(path, V4_TABLES) == before
         assert raw(path, 'SELECT COUNT(*) FROM dispatch_authorizations') == [(0,)]
         assert raw(path, 'SELECT COUNT(*) FROM recovery_evidence') == [(0,)]
         assert raw(path, 'SELECT COUNT(*) FROM mission_reconciliation_contexts') == [(0,)]
+        assert raw(path, 'SELECT COUNT(*) FROM dispatch_goals') == [(0,)]
         fresh = tmp_path / f'fresh-{round_index}.db'
         MissionStore(fresh).close()
         assert schema_of(path) == schema_of(fresh)
@@ -1540,7 +1554,7 @@ def assert_still_version_4(db_path, before, schema):
 
 @pytest.mark.parametrize('failing', [
     'create the authorization table', 'create the evidence table',
-    'create the reconciliation table', 'set the version', 'commit'])
+    'create the reconciliation table', 'create the goal table', 'set the version', 'commit'])
 def test_a_failure_while_migrating_from_version_4_rolls_back_cleanly(
         monkeypatch, db_path, failing):
     make_v4_database(db_path)
@@ -1552,6 +1566,7 @@ def test_a_failure_while_migrating_from_version_4_rolls_back_cleanly(
             'create the authorization table': '_DISPATCH_AUTHORIZATIONS_DDL',
             'create the evidence table': '_RECOVERY_EVIDENCE_DDL',
             'create the reconciliation table': '_MISSION_RECONCILIATION_CONTEXTS_DDL',
+            'create the goal table': '_DISPATCH_GOALS_DDL',
         }[failing]
         with monkeypatch.context() as patch:
             patch.setattr(storage, ddl, 'THIS IS NOT SQL')
@@ -1559,7 +1574,7 @@ def test_a_failure_while_migrating_from_version_4_rolls_back_cleanly(
                 MissionStore(db_path)
     else:
         fails = {
-            'set the version': lambda sql: sql.strip() == 'PRAGMA user_version = 7',
+            'set the version': lambda sql: sql.strip() == 'PRAGMA user_version = 8',
             'commit': lambda sql: sql.strip().upper() == 'COMMIT',
         }[failing]
         with pytest.raises(sqlite3.OperationalError, match='injected failure'):
@@ -1569,11 +1584,12 @@ def test_a_failure_while_migrating_from_version_4_rolls_back_cleanly(
     # A later, healthy open finishes the migration.
     with MissionStore(db_path):
         pass
-    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(8,)]
     assert dump(db_path, V4_TABLES) == before
     assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_authorizations') == [(0,)]
     assert raw(db_path, 'SELECT COUNT(*) FROM recovery_evidence') == [(0,)]
     assert raw(db_path, 'SELECT COUNT(*) FROM mission_reconciliation_contexts') == [(0,)]
+    assert raw(db_path, 'SELECT COUNT(*) FROM dispatch_goals') == [(0,)]
 
 
 # Each origin with each of the three newest DDLs that its own chain still runs. A database that
@@ -1581,7 +1597,8 @@ def test_a_failure_while_migrating_from_version_4_rolls_back_cleanly(
 LATE_STEPS = [
     (origin, ddl) for origin in ORIGINS
     for ddl, last_origin in (('_DISPATCH_AUTHORIZATIONS_DDL', 4), ('_RECOVERY_EVIDENCE_DDL', 5),
-                             ('_MISSION_RECONCILIATION_CONTEXTS_DDL', 6))
+                             ('_MISSION_RECONCILIATION_CONTEXTS_DDL', 6),
+                             ('_DISPATCH_GOALS_DDL', 7))
     if VERSION_OF[origin] <= last_origin]
 
 
@@ -1706,30 +1723,35 @@ def test_a_migrated_unknown_step_cannot_be_prepared_or_authorized(v4_store, db_p
     before = dump(db_path)
 
     with pytest.raises(InvalidStateTransition):
-        v4_store.prepare_step_dispatch(V3_UNKNOWN_ID, 'unknown', ACTION)
+        v4_store.prepare_step_dispatch(V3_UNKNOWN_ID, 'unknown', ACTION, GOAL)
     with pytest.raises(MissionNotRunning):
         v4_store.authorize_step_send(V3_UNKNOWN_ID, 'unknown')
 
     assert dump(db_path) == before
 
 
-def test_a_prepared_step_that_version_4_wrote_is_authorized_normally_now(v4_store, db_path):
+def test_a_prepared_step_that_version_4_wrote_cannot_be_authorized_without_a_goal(
+        v4_store, db_path):
+    # Since Task 013, authorization also requires a bound goal specification, and this row
+    # predates that table: it was written directly by the version 3/4 fixture, never through
+    # prepare_step_dispatch, so it has no goal and none is backfilled. A replay of
+    # prepare_step_dispatch cannot rescue it either: it is still DISPATCH_PREPARED, so the
+    # replay branch is taken, and that branch only ever reads an existing goal, never binds one.
     dispatch_id = v4_store.get_step_dispatch(V3_MAIN_ID, 'prepared').dispatch_id
     assert str(dispatch_id) == V3_DISPATCH_IDS[(V3_MAIN_ID, 'prepared')]
     before = dump(db_path)
 
-    receipt = v4_store.authorize_step_send(V3_MAIN_ID, 'prepared')
+    with pytest.raises(DispatchGoalMissing) as excinfo:
+        v4_store.authorize_step_send(V3_MAIN_ID, 'prepared')
+    assert (excinfo.value.mission_id, excinfo.value.step_key) == (V3_MAIN_ID, 'prepared')
+    with pytest.raises(DispatchGoalMissing):
+        v4_store.prepare_step_dispatch(V3_MAIN_ID, 'prepared', ACTION, GOAL)
 
-    # This is a new authorization, not a backfill: it takes an attempt, writes its record now
-    # and moves the step, like any other.
-    assert receipt.dispatch_id == dispatch_id
-    assert receipt.attempt_number == 4
-    assert v4_store.get_by_mission_id(V3_MAIN_ID).attempts_used == 4
-    assert v4_store.get_step(V3_MAIN_ID, 'prepared').state is S.DISPATCHED
-    assert authorization_rows(db_path) == [(str(dispatch_id), stamp_of(receipt.authorized_at))]
-    diff = table_diff(before, dump(db_path))
-    assert set(diff) == {'missions', 'mission_steps', NEW_TABLE}
-    # Every other migrated dispatch is still without a record.
+    # Not one cell moved: no attempt, no record, no state change.
+    assert dump(db_path) == before
+    assert v4_store.get_step(V3_MAIN_ID, 'prepared').state is S.DISPATCH_PREPARED
+    assert v4_store.get_by_mission_id(V3_MAIN_ID).attempts_used == 3
+    # Every migrated dispatch, this one included, is still without an authorization record.
     for key in PROGRESSED_KEYS:
         with pytest.raises(DispatchAuthorizationMissing):
             v4_store.get_dispatch_authorization(V3_MAIN_ID, key)
@@ -1737,7 +1759,7 @@ def test_a_prepared_step_that_version_4_wrote_is_authorized_normally_now(v4_stor
 
 def test_a_pending_step_that_version_4_wrote_is_prepared_and_authorized_normally(
         v4_store, db_path):
-    dispatch = v4_store.prepare_step_dispatch(V3_MAIN_ID, 'pending', ACTION)
+    dispatch = v4_store.prepare_step_dispatch(V3_MAIN_ID, 'pending', ACTION, GOAL)
     assert authorization_rows(db_path) == []
 
     receipt = v4_store.authorize_step_send(V3_MAIN_ID, 'pending')
@@ -1751,8 +1773,11 @@ def test_a_pending_step_that_version_4_wrote_is_prepared_and_authorized_normally
 
 def test_a_legacy_counter_continues_and_the_record_holds_no_attempt_number(v4_store, db_path):
     assert v4_store.get_by_mission_id(V3_MAIN_ID).attempts_used == 3
+    # 'prepared' predates goal binding and cannot be authorized (see the test above); 'pending'
+    # was never dispatched, so it can still be freshly prepared with a goal and authorized.
+    v4_store.prepare_step_dispatch(V3_MAIN_ID, 'pending', ACTION, GOAL)
 
-    receipt = v4_store.authorize_step_send(V3_MAIN_ID, 'prepared')
+    receipt = v4_store.authorize_step_send(V3_MAIN_ID, 'pending')
 
     # The counter carried on from the legacy value, and the receipt says so. The record has
     # only the dispatch and the time, and the store offers no way to ask which attempt it was.
@@ -1760,22 +1785,22 @@ def test_a_legacy_counter_continues_and_the_record_holds_no_attempt_number(v4_st
     assert v4_store.get_by_mission_id(V3_MAIN_ID).attempts_used == 4
     assert [row[1] for row in raw(db_path, 'PRAGMA table_info(dispatch_authorizations)')] == [
         'dispatch_id', 'authorized_at']
-    record = v4_store.get_dispatch_authorization(V3_MAIN_ID, 'prepared')
+    record = v4_store.get_dispatch_authorization(V3_MAIN_ID, 'pending')
     assert not hasattr(record, 'attempt_number')
 
 
 def test_the_number_of_records_is_not_the_attempt_counter(v4_store, db_path):
-    v4_store.authorize_step_send(V3_MAIN_ID, 'prepared')
-    v4_store.prepare_step_dispatch(V3_MAIN_ID, 'pending', ACTION)
-    second = v4_store.authorize_step_send(V3_MAIN_ID, 'pending')
+    # Three authorizations happened before this database was migrated and left no record: the
+    # counter starts at 3. 'prepared' predates goal binding and can never be authorized now (see
+    # above), so only 'pending' can still be freshly authorized, leaving exactly one record
+    # although the counter is four. The counter includes the unrecorded legacy attempts and the
+    # rows cannot, so one says nothing about the other.
+    v4_store.prepare_step_dispatch(V3_MAIN_ID, 'pending', ACTION, GOAL)
+    receipt = v4_store.authorize_step_send(V3_MAIN_ID, 'pending')
 
-    # Three authorizations happened before this database was migrated and left no record. The
-    # counter includes them and the rows cannot, so one says nothing about the other.
-    assert second.attempt_number == 5
-    assert v4_store.get_by_mission_id(V3_MAIN_ID).attempts_used == 5
-    assert len(authorization_rows(db_path)) == 2
-    mission = v4_store.get_by_mission_id(V3_MAIN_ID)
-    assert mission.attempts_used == mission.max_attempts == 5
+    assert receipt.attempt_number == 4
+    assert v4_store.get_by_mission_id(V3_MAIN_ID).attempts_used == 4
+    assert len(authorization_rows(db_path)) == 1
 
 
 # The gap that version 5 closes
@@ -2491,16 +2516,17 @@ def test_no_method_creates_repairs_backfills_or_attests_a_record():
 
     assert not [name for name in names if any(word in name.lower() for word in (
         'backfill', 'repair', 'attest', 'restore', 'grant', 'infer', 'reconstruct'))]
-    # Task 010 added one read. Task 011 has since added the write and the read of evidence, and
-    # Task 012 the four reconciliation operations. Nothing writes an authorization record but
-    # authorize_step_send.
+    # Task 010 added one read. Task 011 has since added the write and the read of evidence,
+    # Task 012 the four reconciliation operations, and Task 013 the read of a goal
+    # specification. Nothing writes an authorization record but authorize_step_send.
     assert sorted(name for name in names if not name.startswith('_')) == sorted([
         'apply_recovery_observation', 'authorize_step_send', 'close', 'create_or_get',
         'enter_mission_reconciliation', 'get_by_mission_id', 'get_by_request_id', 'get_dispatch',
-        'get_dispatch_authorization', 'get_dispatch_context', 'get_mission_reconciliation_context',
-        'get_recovery_evidence', 'get_step', 'get_step_dispatch', 'get_steps', 'initialize_steps',
-        'prepare_step_dispatch', 'request_cancellation_during_reconciliation',
-        'resolve_mission_reconciliation', 'transition_mission_state', 'transition_step_state'])
+        'get_dispatch_authorization', 'get_dispatch_context', 'get_dispatch_goal',
+        'get_mission_reconciliation_context', 'get_recovery_evidence', 'get_step',
+        'get_step_dispatch', 'get_steps', 'initialize_steps', 'prepare_step_dispatch',
+        'request_cancellation_during_reconciliation', 'resolve_mission_reconciliation',
+        'transition_mission_state', 'transition_step_state'])
 
 
 def test_the_production_modules_import_no_ros_network_process_or_time_package():

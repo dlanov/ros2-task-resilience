@@ -312,8 +312,10 @@ v1 -> v2 -> v3 -> v4 -> v5 -> v6
 ```
 
 A migrated database has the same schema text as a fresh database of the same version. Nothing is
-inferred about what was observed before the table existed. Task 012 has since added schema version 7 and
-one more step to every chain above, and changes nothing of this table.
+inferred about what was observed before the table existed. Task 012 has since added schema version 7,
+and Task 013 schema version 8 with the goal specification of a dispatch
+(`docs/dispatch_goal_model.md`), one more step to every chain above each time; neither changes anything
+of this table, and this table is read by neither.
 
 ## Legacy databases
 

@@ -58,7 +58,11 @@ from task_resilience.errors import (
     MissionReconciliationRequired,
     NoUnknownStepToReconcile,
 )
-from task_resilience.model import MissionReconciliationContextRecord, MissionRecord
+from task_resilience.model import (
+    ExpectedGoalSpecification,
+    MissionReconciliationContextRecord,
+    MissionRecord,
+)
 from task_resilience.reconciliation import (
     ActionStatus,
     ExpectedActionContext,
@@ -83,13 +87,17 @@ ACTION = ExpectedActionContext(
     action_name='/navigate_to_pose', action_type='nav2_msgs/action/NavigateToPose',
     robot_namespace='/robot1')
 
+GOAL = ExpectedGoalSpecification(
+    goal_format='test/goal/v1', payload={'target': 'checkpoint-a'})
+
 M = MissionState
 S = StepState
 SUC, CAN, ABO = ActionStatus.SUCCEEDED, ActionStatus.CANCELED, ActionStatus.ABORTED
 
 KEYS = ('a', 'b', 'c')
 CONTEXT_TABLE = 'mission_reconciliation_contexts'
-ALL_TABLES = (*V6_TABLES, CONTEXT_TABLE)
+GOAL_TABLE = 'dispatch_goals'
+ALL_TABLES = (*V6_TABLES, CONTEXT_TABLE, GOAL_TABLE)
 
 # Each round is an independent race, repeated because a single race can be won "by luck".
 ROUNDS = 25
@@ -195,7 +203,7 @@ def new_mission(store, keys=KEYS, route=(M.RUNNING,), request_id='req-001', max_
     mission_id = store.create_or_get(request_id, {'goal': 'demo'}, max_attempts).mission_id
     store.initialize_steps(mission_id, list(keys))
     for key in keys:
-        store.prepare_step_dispatch(mission_id, key, ACTION)
+        store.prepare_step_dispatch(mission_id, key, ACTION, GOAL)
     for state in route:
         store.transition_mission_state(mission_id, state)
     return mission_id
@@ -261,13 +269,16 @@ ALL_STATES = list(M)
 
 # A. The schema and its migration
 
-def test_the_schema_is_exactly_version_7_with_one_new_table(db_path):
+def test_the_schema_is_exactly_version_8_with_two_new_tables_since_version_6(db_path):
     MissionStore(db_path).close()
 
-    assert storage.SCHEMA_VERSION == 7
-    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
+    # This file's own contract is what version 7 (Task 012) added over version 6: exactly the
+    # reconciliation table. Version 8 (Task 013) has since added the goal table; it changed
+    # nothing else here, so the two new tables together are the full difference from version 6.
+    assert storage.SCHEMA_VERSION == 8
+    assert raw(db_path, 'PRAGMA user_version') == [(8,)]
     assert table_names(db_path) == set(ALL_TABLES)
-    assert table_names(db_path) - set(V6_TABLES) == {CONTEXT_TABLE}
+    assert table_names(db_path) - set(V6_TABLES) == {CONTEXT_TABLE, GOAL_TABLE}
 
 
 def test_the_context_table_is_exactly_the_reviewed_shape(db_path):
@@ -368,14 +379,14 @@ def test_every_older_database_migrates_with_zero_contexts_and_the_schema_of_a_fr
 
     MissionStore(db_path).close()
 
-    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(8,)]
     assert old_rows(db_path, origin) == before
     assert table_names(db_path) == set(ALL_TABLES)
     assert context_rows(db_path) == []
     assert schema_of(db_path) == fresh_schema(tmp_path)
 
 
-def test_a_native_version_6_database_runs_only_the_last_step(monkeypatch, db_path):
+def test_a_native_version_6_database_runs_only_the_steps_after_version_6(monkeypatch, db_path):
     make_v6_database(db_path)
     called = []
     for name in MIGRATIONS:
@@ -390,14 +401,17 @@ def test_a_native_version_6_database_runs_only_the_last_step(monkeypatch, db_pat
     store, connection = open_faulty_store(monkeypatch, db_path)
     store.close()
 
-    assert called == ['_migrate_v6_to_v7']
-    # Everything the open executed: the settings, the one transaction, the one table, the version.
+    assert called == ['_migrate_v6_to_v7', '_migrate_v7_to_v8']
+    # Everything the open executed: the settings, the one transaction, the two tables, the
+    # version, in that order, with the version set only once, to the current one.
     statements = connection.statements
     assert statements[:4] == [
         'PRAGMA synchronous = FULL', 'PRAGMA foreign_keys = ON', 'BEGIN IMMEDIATE',
         'PRAGMA user_version']
     assert statements[4] == squashed(CONTEXT_DDL)
-    assert statements[5:] == ['PRAGMA user_version = 7', 'COMMIT']
+    assert statements[5].startswith('CREATE TABLE dispatch_goals')
+    assert 'PRAGMA user_version = 7' not in statements
+    assert statements[6:] == ['PRAGMA user_version = 8', 'COMMIT']
     assert context_rows(db_path) == []
 
 
@@ -427,21 +441,24 @@ def test_a_mission_that_was_already_reconciling_gets_no_context_and_nothing_else
             for table in V6_TABLES} == before
 
 
-@pytest.mark.parametrize('failing', ['create the table', 'set the version', 'commit'])
+@pytest.mark.parametrize('failing', [
+    'create the table', 'create the goal table', 'set the version', 'commit'])
 def test_a_failure_while_migrating_from_version_6_rolls_back_cleanly(
         monkeypatch, db_path, failing):
     make_v6_database(db_path)
     before = {table: raw(db_path, f'SELECT * FROM {table} ORDER BY 1, 2') for table in V6_TABLES}
     schema = schema_of(db_path)
 
-    if failing == 'create the table':
+    if failing in ('create the table', 'create the goal table'):
+        ddl = {'create the table': '_MISSION_RECONCILIATION_CONTEXTS_DDL',
+               'create the goal table': '_DISPATCH_GOALS_DDL'}[failing]
         with monkeypatch.context() as patch:
-            patch.setattr(storage, '_MISSION_RECONCILIATION_CONTEXTS_DDL', 'THIS IS NOT SQL')
+            patch.setattr(storage, ddl, 'THIS IS NOT SQL')
             with pytest.raises(sqlite3.OperationalError):
                 MissionStore(db_path)
     else:
         fails = {
-            'set the version': lambda sql: sql.strip() == 'PRAGMA user_version = 7',
+            'set the version': lambda sql: sql.strip() == 'PRAGMA user_version = 8',
             'commit': lambda sql: sql.strip().upper() == 'COMMIT',
         }[failing]
         with pytest.raises(sqlite3.OperationalError, match='injected failure'):
@@ -458,7 +475,7 @@ def test_a_failure_while_migrating_from_version_6_rolls_back_cleanly(
     # A later, healthy open finishes the migration.
     with MissionStore(db_path):
         pass
-    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(8,)]
     assert context_rows(db_path) == []
 
 
@@ -478,7 +495,7 @@ def test_concurrent_opens_of_a_version_6_database_migrate_it_once(tmp_path):
             for future in [pool.submit(open_and_close) for _ in range(workers)]:
                 future.result(timeout=TIMEOUT)
 
-        assert raw(path, 'PRAGMA user_version') == [(7,)]
+        assert raw(path, 'PRAGMA user_version') == [(8,)]
         assert {table: raw(path, f'SELECT * FROM {table} ORDER BY 1, 2')
                 for table in V6_TABLES} == before
         assert context_rows(path) == []
@@ -498,13 +515,14 @@ def test_reopening_a_migrated_database_changes_nothing(monkeypatch, db_path, ori
 
     assert writes(connection.statements) == []
     assert (dump(db_path), schema_of(db_path)) == before
-    assert raw(db_path, 'PRAGMA user_version') == [(7,)]
+    assert raw(db_path, 'PRAGMA user_version') == [(8,)]
 
 
 def test_the_versions_the_fixtures_claim_are_the_versions():
-    # Nothing reads a version from a table, and version 6 is the newest older one.
+    # Nothing reads a version from a table, and version 6 is the newest older one this file's
+    # own fixtures reach. Task 013 has since added one more step, after this file's own.
     assert VERSION_OF == {'v1': 1, 'v2': 2, 'v3': 3, 'v4': 4, 'v5': 5, 'v6': 6}
-    assert MIGRATIONS[-1] == '_migrate_v6_to_v7'
+    assert MIGRATIONS[-2:] == ['_migrate_v6_to_v7', '_migrate_v7_to_v8']
 
 
 # B. Why the table exists: the older tables cannot say where a reconciling mission came from

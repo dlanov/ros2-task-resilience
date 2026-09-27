@@ -18,6 +18,7 @@ import sqlite3
 import pytest
 
 from task_resilience.errors import AttemptLimitReached, MissionNotFound
+from task_resilience.model import ExpectedGoalSpecification
 from task_resilience.reconciliation import ExpectedActionContext
 from task_resilience.state_machine import MissionState, StepState
 from task_resilience.storage import MissionStore
@@ -26,6 +27,9 @@ from task_resilience.storage import MissionStore
 ACTION = ExpectedActionContext(
     action_name='/navigate_to_pose', action_type='nav2_msgs/action/NavigateToPose',
     robot_namespace='/robot1')
+
+GOAL = ExpectedGoalSpecification(
+    goal_format='test/goal/v1', payload={'target': 'checkpoint-a'})
 
 KEYS = ['checkpoint_a', 'return_to_base', 'final_check']
 
@@ -47,7 +51,7 @@ def running_mission(store, request_id, max_attempts, keys=KEYS[:2]):
     store.initialize_steps(mission.mission_id, keys)
     store.transition_mission_state(mission.mission_id, MissionState.RUNNING)
     for key in keys:
-        store.prepare_step_dispatch(mission.mission_id, key, ACTION)
+        store.prepare_step_dispatch(mission.mission_id, key, ACTION, GOAL)
     return mission.mission_id
 
 

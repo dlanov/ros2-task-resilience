@@ -9,8 +9,9 @@ This note defines the action context that is bound to a dispatch, and how it is 
 Schema version 4 adds exactly one table, `dispatch_contexts`. It adds no other table, column or
 index, and it changes no existing row. Task 010 has since moved the schema to version 5 with one more
 table, `dispatch_authorizations` (`docs/dispatch_authorization_model.md`), Task 011 to version 6 with the
-evidence table, and Task 012 to version 7 with the reconciliation context of a mission
-(`docs/mission_reconciliation_model.md`). None of that changes anything described here: this note is about what version 4 added, and the context is bound, read and
+evidence table, Task 012 to version 7 with the reconciliation context of a mission
+(`docs/mission_reconciliation_model.md`), and Task 013 to version 8 with the goal specification of a
+dispatch (`docs/dispatch_goal_model.md`). None of that changes anything described here: this note is about what version 4 added, and the context is bound, read and
 protected exactly as below.
 
 The contract in one sentence: **any context created by supported schema version 4 code was
@@ -186,7 +187,7 @@ database that is already at version 4 runs only the version 5 step.
 
 Migration creates **zero** context rows and invents no action name, type or namespace. A
 migrated database has the same schema text as a fresh database of the same version (4 when this
-note was written, 7 since Task 012). The tests build their
+note was written, 8 since Task 013). The tests build their
 version 3 database from the version 3 schema written out in full. That text was checked, when this
 task was written, against what the committed version 3 code creates: the two were identical.
 
@@ -219,12 +220,12 @@ flight, unknown or finished under version 3.
 ## Correlation is not the same as proving the goal
 
 The context is for **action correlation**: which action a result or status is about. It is not a
-proof that the correct goal body was sent. `GetResult` does not return the goal, so evidence
-obtained by UUID cannot show what the original request contained, and Task 006 found a UUID the
-server had forgotten accepted again as a new goal, so a UUID does not pin the request body. The
-project also has no durable per-step goal specification yet.
-So no goal body and no goal hash is stored, and binding the goal is deferred until such a
-specification exists.
+proof that the correct goal body was sent, and this table alone still does not store one:
+`GetResult` does not return the goal, so evidence obtained by UUID cannot show what the original
+request contained, and Task 006 found a UUID the server had forgotten accepted again as a new
+goal, so a UUID does not pin the request body. Task 013 has since added a durable per-dispatch
+goal specification (`docs/dispatch_goal_model.md`), bound alongside this context; it reads and
+changes nothing here, and this table still stores no goal body or goal hash itself.
 
 ## Errors
 

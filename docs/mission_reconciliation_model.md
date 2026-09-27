@@ -285,6 +285,12 @@ definition, and uses no `ALTER TABLE`. A version 1, 2, 3, 4 or 5 database goes t
 one transaction it already used. A fresh database and a migrated one have the same schema text. A migrated
 `NEEDS_RECONCILIATION` mission receives no row.
 
+**A later schema note.** Task 013 has since moved the current schema to version 8, adding
+`dispatch_goals`. None of this task's four operations (`enter_mission_reconciliation`,
+`resolve_mission_reconciliation`, `request_cancellation_during_reconciliation`,
+`get_mission_reconciliation_context`) reads that table, and this task's contract is unchanged. See
+`docs/dispatch_goal_model.md`.
+
 ## What this task does not do
 
 It does not query ROS, send, cancel or retry anything, run an adapter or a supervisor, change a step, read

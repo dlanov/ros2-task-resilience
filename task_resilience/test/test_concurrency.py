@@ -28,7 +28,7 @@ from task_resilience.errors import (
     MissionCompletionInvariantError,
     StepDefinitionConflict,
 )
-from task_resilience.model import DispatchRecord
+from task_resilience.model import DispatchRecord, ExpectedGoalSpecification
 from task_resilience.reconciliation import ExpectedActionContext
 from task_resilience.state_machine import MissionState, StepState
 from task_resilience.storage import MissionStore
@@ -37,6 +37,9 @@ from task_resilience.storage import MissionStore
 ACTION = ExpectedActionContext(
     action_name='/navigate_to_pose', action_type='nav2_msgs/action/NavigateToPose',
     robot_namespace='/robot1')
+
+GOAL = ExpectedGoalSpecification(
+    goal_format='test/goal/v1', payload={'target': 'checkpoint-a'})
 
 # Each round is an independent race. A single race can be won "by luck" if the
 # threads happen not to overlap, so repeat it.
@@ -81,7 +84,7 @@ def running_missions(db_path, count, max_attempts, keys):
             store.initialize_steps(mission.mission_id, keys)
             store.transition_mission_state(mission.mission_id, MissionState.RUNNING)
             for key in keys:
-                store.prepare_step_dispatch(mission.mission_id, key, ACTION)
+                store.prepare_step_dispatch(mission.mission_id, key, ACTION, GOAL)
             mission_ids.append(mission.mission_id)
     return mission_ids
 
@@ -189,7 +192,7 @@ def test_concurrent_first_open_creates_the_schema_once(tmp_path):
                 future.result(timeout=TIMEOUT)
 
         with contextlib.closing(sqlite3.connect(path)) as conn:
-            assert conn.execute('PRAGMA user_version').fetchone()[0] == 7
+            assert conn.execute('PRAGMA user_version').fetchone()[0] == 8
 
 
 def test_lock_timeout_surfaces_and_consumes_nothing(db_path):
@@ -197,7 +200,7 @@ def test_lock_timeout_surfaces_and_consumes_nothing(db_path):
         mission = store.create_or_get('req-001', {'x': 1}, 1)
         store.initialize_steps(mission.mission_id, ['checkpoint'])
         store.transition_mission_state(mission.mission_id, MissionState.RUNNING)
-        store.prepare_step_dispatch(mission.mission_id, 'checkpoint', ACTION)
+        store.prepare_step_dispatch(mission.mission_id, 'checkpoint', ACTION, GOAL)
 
         blocker = sqlite3.connect(db_path, isolation_level=None)
         blocker.execute('BEGIN IMMEDIATE')
@@ -222,7 +225,7 @@ def missions_with_an_executing_step(db_path, count):
             mission = store.create_or_get(f'req-{n}', {'n': n}, 3)
             store.initialize_steps(mission.mission_id, ['checkpoint'])
             store.transition_mission_state(mission.mission_id, MissionState.RUNNING)
-            store.prepare_step_dispatch(mission.mission_id, 'checkpoint', ACTION)
+            store.prepare_step_dispatch(mission.mission_id, 'checkpoint', ACTION, GOAL)
             # DISPATCHED is entered only by authorizing the send.
             store.authorize_step_send(mission.mission_id, 'checkpoint')
             for state in (StepState.ACCEPTED, StepState.EXECUTING):
@@ -384,7 +387,8 @@ def test_concurrent_preparation_of_one_step_gives_everyone_the_same_dispatch(db_
 
     results = run_concurrently(
         db_path, workers, ROUNDS,
-        lambda store, worker, n: store.prepare_step_dispatch(mission_ids[n], 'checkpoint', ACTION))
+        lambda store, worker, n: store.prepare_step_dispatch(
+            mission_ids[n], 'checkpoint', ACTION, GOAL))
 
     with MissionStore(db_path) as store:
         for n, mission_id in enumerate(mission_ids):
@@ -404,7 +408,7 @@ def test_a_dispatch_exists_exactly_when_preparation_won_the_race_with_a_cancella
     def act(store, worker, n):
         if worker == 0:
             try:
-                return store.prepare_step_dispatch(mission_ids[n], 'checkpoint', ACTION)
+                return store.prepare_step_dispatch(mission_ids[n], 'checkpoint', ACTION, GOAL)
             except InvalidStateTransition as refusal:
                 return refusal
         return store.transition_step_state(mission_ids[n], 'checkpoint', StepState.CANCELLED)
@@ -457,7 +461,7 @@ def test_a_direct_transition_racing_preparation_cannot_leave_an_orphan_prepared_
 
     def act(store, worker, n):
         if worker % 2 == 0:
-            return store.prepare_step_dispatch(mission_ids[n], 'checkpoint', ACTION)
+            return store.prepare_step_dispatch(mission_ids[n], 'checkpoint', ACTION, GOAL)
         try:
             store.transition_step_state(mission_ids[n], 'checkpoint', StepState.DISPATCH_PREPARED)
         except DispatchPreparationRequired as refusal:

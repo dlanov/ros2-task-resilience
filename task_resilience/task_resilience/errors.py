@@ -361,3 +361,41 @@ class CorruptMissionReconciliationContext(Exception):
         self.mission_id = mission_id
         self.reason = reason
         self.value = value
+
+
+class DispatchGoalMissing(Exception):
+    """A dispatch exists, but no durable goal specification is bound to it."""
+
+    def __init__(self, mission_id: str, step_key: str) -> None:
+        super().__init__(
+            f'dispatch of step {step_key!r} of mission {mission_id!r} has no bound goal '
+            'specification')
+        self.mission_id = mission_id
+        self.step_key = step_key
+
+
+class DispatchGoalConflict(Exception):
+    """A dispatch is already bound to a goal specification, and the requested one differs."""
+
+    def __init__(self, mission_id: str, step_key: str, fields: tuple[str, ...]) -> None:
+        super().__init__(
+            f'dispatch of step {step_key!r} of mission {mission_id!r} is already bound to a '
+            f'different goal specification: {", ".join(fields)}')
+        self.mission_id = mission_id
+        self.step_key = step_key
+        # The names of the aspects that differ ("goal_format", "goal_content"), never the values.
+        self.fields = fields
+
+
+class CorruptDispatchGoal(Exception):
+    """A dispatch's stored goal specification cannot be read as a valid goal."""
+
+    def __init__(
+        self, mission_id: str, step_key: str, reason: str, value: object = None,
+    ) -> None:
+        super().__init__(
+            f'goal specification of step {step_key!r} of mission {mission_id!r}: {reason}')
+        self.mission_id = mission_id
+        self.step_key = step_key
+        self.reason = reason
+        self.value = value

@@ -35,6 +35,7 @@ from task_resilience.errors import (
     SendAuthorizationRequired,
     StepNotFound,
 )
+from task_resilience.model import ExpectedGoalSpecification
 from task_resilience.reconciliation import (
     ActionStatus,
     ExpectedActionContext,
@@ -48,6 +49,9 @@ from task_resilience.storage import MissionStore
 ACTION = ExpectedActionContext(
     action_name='/navigate_to_pose', action_type='nav2_msgs/action/NavigateToPose',
     robot_namespace='/robot1')
+
+GOAL = ExpectedGoalSpecification(
+    goal_format='test/goal/v1', payload={'target': 'checkpoint-a'})
 
 M = MissionState
 S = StepState
@@ -97,7 +101,7 @@ def drive(store, mission_id, key, state):
     for step in ROUTE_TO[state]:
         if step is S.DISPATCH_PREPARED:
             # A plain transition cannot enter this state...
-            store.prepare_step_dispatch(mission_id, key, ACTION)
+            store.prepare_step_dispatch(mission_id, key, ACTION, GOAL)
         elif step is S.DISPATCHED:
             # ...nor this one. It takes authorizing the send, which needs a RUNNING mission
             # and an attempt.
@@ -482,7 +486,7 @@ def test_no_ordinary_transition_leaves_needs_reconciliation(store, running):
     # Even with every step finished, the mission cannot simply be completed. The mission enters
     # reconciliation while a step is unknown, and Task 011's evidence then settles that step.
     drive(store, running.mission_id, 'return_to_base', S.SUCCEEDED)
-    store.prepare_step_dispatch(running.mission_id, 'checkpoint_a', ACTION)
+    store.prepare_step_dispatch(running.mission_id, 'checkpoint_a', ACTION, GOAL)
     dispatch_id = store.get_step_dispatch(running.mission_id, 'checkpoint_a').dispatch_id
     store.authorize_step_send(running.mission_id, 'checkpoint_a')
     store.transition_step_state(running.mission_id, 'checkpoint_a', S.OUTCOME_UNKNOWN)
@@ -535,7 +539,7 @@ def test_an_unknown_stored_mission_state_is_an_error_not_a_guess(store, mission,
 
 def test_corruption_found_while_authorizing_a_send_leaves_nothing_behind(
         store, running, db_path):
-    store.prepare_step_dispatch(running.mission_id, 'checkpoint_a', ACTION)
+    store.prepare_step_dispatch(running.mission_id, 'checkpoint_a', ACTION, GOAL)
 
     corrupt(db_path, "UPDATE missions SET mission_state = 'BOGUS'")
     with pytest.raises(CorruptStoredState):
@@ -578,7 +582,7 @@ def test_an_unknown_stored_step_state_is_an_error_not_a_guess(store, mission, db
 # Attempt accounting is independent
 
 def test_only_authorizing_a_send_consumes_an_attempt(store, running):
-    store.prepare_step_dispatch(running.mission_id, 'checkpoint_a', ACTION)
+    store.prepare_step_dispatch(running.mission_id, 'checkpoint_a', ACTION, GOAL)
     assert store.get_by_mission_id(running.mission_id).attempts_used == 0
 
     store.authorize_step_send(running.mission_id, 'checkpoint_a')
@@ -590,7 +594,7 @@ def test_only_authorizing_a_send_consumes_an_attempt(store, running):
 
 
 def test_authorizing_a_send_does_not_change_the_mission_state(store, running):
-    store.prepare_step_dispatch(running.mission_id, 'checkpoint_a', ACTION)
+    store.prepare_step_dispatch(running.mission_id, 'checkpoint_a', ACTION, GOAL)
 
     receipt = store.authorize_step_send(running.mission_id, 'checkpoint_a')
 
@@ -606,7 +610,7 @@ def test_the_attempt_limit_still_holds_alongside_state(store):
     store.initialize_steps(one_shot.mission_id, KEYS)
     store.transition_mission_state(one_shot.mission_id, M.RUNNING)
     for key in KEYS:
-        store.prepare_step_dispatch(one_shot.mission_id, key, ACTION)
+        store.prepare_step_dispatch(one_shot.mission_id, key, ACTION, GOAL)
     store.authorize_step_send(one_shot.mission_id, KEYS[0])
 
     with pytest.raises(AttemptLimitReached):
