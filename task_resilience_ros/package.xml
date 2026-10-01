@@ -7,6 +7,12 @@
   <maintainer email="dennis.lanov@gmail.com">Dennis Lanov</maintainer>
   <license>Apache-2.0</license>
 
+  <depend>task_resilience</depend>
+  <depend>rclpy</depend>
+  <depend>nav2_msgs</depend>
+  <depend>unique_identifier_msgs</depend>
+  <depend>action_msgs</depend>
+
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
