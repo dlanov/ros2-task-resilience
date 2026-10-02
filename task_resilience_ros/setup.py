@@ -32,4 +32,9 @@ setup(
     license='Apache-2.0',
     # colcon skips pytest entirely unless the package declares it here.
     tests_require=['pytest'],
+    entry_points={
+        'console_scripts': [
+            'task016_supervisor = task_resilience_ros.supervisor_cli:main',
+        ],
+    },
 )
